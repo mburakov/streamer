@@ -547,16 +547,17 @@ bool GpuFrameConvert(const struct GpuFrame* from, const struct GpuFrame* to) {
 void GpuFrameDestroy(struct GpuFrame** gpu_frame) {
   if (!gpu_frame || !*gpu_frame) return;
   for (size_t i = LENGTH((*gpu_frame)->textures); i; i--) {
-    if ((*gpu_frame)->textures[i])
-      glDeleteTextures(1, &(*gpu_frame)->textures[i]);
+    if ((*gpu_frame)->textures[i - 1])
+      glDeleteTextures(1, &(*gpu_frame)->textures[i - 1]);
   }
   for (size_t i = LENGTH((*gpu_frame)->images); i; i--) {
-    if ((*gpu_frame)->images[i] != EGL_NO_IMAGE)
+    if ((*gpu_frame)->images[i - 1] != EGL_NO_IMAGE)
       eglDestroyImage((*gpu_frame)->gpu_context->display,
-                      (*gpu_frame)->images[i]);
+                      (*gpu_frame)->images[i - 1]);
   }
   for (size_t i = LENGTH((*gpu_frame)->dmabuf_fds); i; i--) {
-    if ((*gpu_frame)->dmabuf_fds[i] != -1) close((*gpu_frame)->dmabuf_fds[i]);
+    if ((*gpu_frame)->dmabuf_fds[i - 1] != -1)
+      close((*gpu_frame)->dmabuf_fds[i - 1]);
   }
   free(*gpu_frame);
   *gpu_frame = NULL;
