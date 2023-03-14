@@ -191,7 +191,7 @@ const struct GpuFrame* EncodeContextGetFrame(
   encode_context->gpu_frame = RELEASE(gpu_frame);
 
 release_planes:
-  for (size_t i = LENGTH(planes); i; i--) close(planes[i - 1].dmabuf_fd);
+  for (size_t i = prime.num_objects; i; i--) close(prime.objects[i - 1].fd);
   return encode_context->gpu_frame;
 }
 
