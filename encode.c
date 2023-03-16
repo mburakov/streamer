@@ -223,7 +223,7 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     }
 
     packet->stream_index = 0;
-    bool result = write(fd, packet->data, (size_t)packet->size) != packet->size;
+    bool result = write(fd, packet->data, (size_t)packet->size) == packet->size;
     av_packet_unref(packet);
     if (!result) {
       LOG("Failed to write full packet (%s)", strerror(errno));
