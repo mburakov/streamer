@@ -125,7 +125,7 @@ int main(int argc, char* argv[]) {
 
     GpuContextSync(gpu_context);
     unsigned long long before_encode = MicrosNow();
-    if (!EncodeContextEncodeFrame(encode_context)) {
+    if (!EncodeContextEncodeFrame(encode_context, STDOUT_FILENO)) {
       LOG("Failed to encode frame");
       return EXIT_FAILURE;
     }
@@ -142,7 +142,7 @@ int main(int argc, char* argv[]) {
     if (micros) usleep((unsigned)micros);
   }
 
-  if (!EncodeContextEncodeFrame(encode_context)) {
+  if (!EncodeContextEncodeFrame(encode_context, STDOUT_FILENO)) {
     LOG("Failed to drain encoder");
     return EXIT_FAILURE;
   }

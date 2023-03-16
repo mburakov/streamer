@@ -29,7 +29,7 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
                                           uint32_t width, uint32_t height);
 const struct GpuFrame* EncodeContextGetFrame(
     struct EncodeContext* encode_context);
-bool EncodeContextEncodeFrame(struct EncodeContext* encode_context);
+bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd);
 void EncodeContextDestroy(struct EncodeContext** encode_context);
 
 #endif  // STREAMER_ENCODE_H_

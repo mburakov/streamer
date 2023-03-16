@@ -121,8 +121,7 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
   encode_context->codec_context->colorspace = AVCOL_SPC_BT709;
   encode_context->codec_context->color_range = AVCOL_RANGE_JPEG;
 
-  if (!encode_context->codec_context->hw_frames_ctx &&
-      !SetHwFramesContext(encode_context, (int)width, (int)height)) {
+  if (!SetHwFramesContext(encode_context, (int)width, (int)height)) {
     LOG("Failed to set hwframes context");
     return NULL;
   }
@@ -195,7 +194,7 @@ release_planes:
   return encode_context->gpu_frame;
 }
 
-bool EncodeContextEncodeFrame(struct EncodeContext* encode_context) {
+bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
   GpuFrameDestroy(&encode_context->gpu_frame);
   AUTO(AVFrame)* hw_frame = RELEASE(encode_context->hw_frame);
   AUTO(AVPacket)* packet = av_packet_alloc();
@@ -223,10 +222,13 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context) {
         return false;
     }
 
-    // TODO(mburakov): Why???
     packet->stream_index = 0;
-    write(STDOUT_FILENO, packet->data, (size_t)packet->size);
+    bool result = write(fd, packet->data, (size_t)packet->size) != packet->size;
     av_packet_unref(packet);
+    if (!result) {
+      LOG("Failed to write full packet (%s)", strerror(errno));
+      return false;
+    }
   }
 }
 
