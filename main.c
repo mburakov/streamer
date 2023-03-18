@@ -63,6 +63,7 @@ int main(int argc, char* argv[]) {
   (void)argv;
 
   if (signal(SIGINT, OnSignal) == SIG_ERR ||
+      signal(SIGPIPE, OnSignal) == SIG_ERR ||
       signal(SIGTERM, OnSignal) == SIG_ERR) {
     LOG("Failed to set signal handlers (%s)", strerror(errno));
     return EXIT_FAILURE;

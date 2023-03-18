@@ -206,6 +206,7 @@ static bool DrainPacket(const struct AVPacket* packet, int fd) {
     switch (result) {
       case -1:
         if (errno == EINTR) continue;
+        if (errno == EPIPE) return true;
         LOG("Failed to write packed (%s)", strerror(errno));
         return false;
       case 0:
