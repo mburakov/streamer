@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <va/va.h>
 #include <va/va_drmcommon.h>
@@ -194,6 +195,35 @@ release_planes:
   return encode_context->gpu_frame;
 }
 
+static bool DrainPacket(const struct AVPacket* packet, int fd) {
+  uint32_t size = (uint32_t)packet->size;
+  struct iovec iov[] = {
+      {.iov_base = &size, .iov_len = sizeof(size)},
+      {.iov_base = packet->data, .iov_len = (size_t)packet->size},
+  };
+  for (;;) {
+    ssize_t result = writev(fd, iov, LENGTH(iov));
+    switch (result) {
+      case -1:
+        if (errno == EINTR) continue;
+        LOG("Failed to write packed (%s)", strerror(errno));
+        return false;
+      case 0:
+        LOG("Output file descriptor closed");
+        return false;
+      default:
+        break;
+    }
+    for (size_t i = 0; i < LENGTH(iov); i++) {
+      size_t delta = MIN((size_t)result, iov[i].iov_len);
+      iov[i].iov_base = (uint8_t*)iov[i].iov_base + delta;
+      iov[i].iov_len -= delta;
+      result -= delta;
+    }
+    if (!result) return true;
+  }
+}
+
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
   GpuFrameDestroy(&encode_context->gpu_frame);
   AUTO(AVFrame)* hw_frame = RELEASE(encode_context->hw_frame);
@@ -223,7 +253,7 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     }
 
     packet->stream_index = 0;
-    bool result = write(fd, packet->data, (size_t)packet->size) == packet->size;
+    bool result = DrainPacket(packet, fd);
     av_packet_unref(packet);
     if (!result) {
       LOG("Failed to write full packet (%s)", strerror(errno));
