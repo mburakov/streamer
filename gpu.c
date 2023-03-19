@@ -36,6 +36,13 @@
 
 #include "util.h"
 
+#define LOOKUP_FUNCTION(a, b)                 \
+  gpu_context->b = (a)eglGetProcAddress(#b);  \
+  if (!gpu_context->b) {                      \
+    LOG("Failed to look up " #b " function"); \
+    return NULL;                              \
+  }
+
 // TODO(mburakov): It should be theoretically possible to do everything in a
 // single pass using a compute shader and GLES3. Unfortunately my test machine
 // reports the primary framebuffer as multiplane. This is probably the reason
@@ -53,6 +60,8 @@ extern const char _binary_chroma_glsl_end[];
 struct GpuContext {
   EGLDisplay display;
   EGLContext context;
+  PFNEGLQUERYDMABUFFORMATSEXTPROC eglQueryDmaBufFormatsEXT;
+  PFNEGLQUERYDMABUFMODIFIERSEXTPROC eglQueryDmaBufModifiersEXT;
   PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
   GLuint program_luma;
   GLuint program_chroma;
@@ -305,6 +314,8 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
       !HasExtension(egl_ext, "EGL_EXT_image_dma_buf_import") ||
       !HasExtension(egl_ext, "EGL_EXT_image_dma_buf_import_modifiers"))
     return NULL;
+  LOOKUP_FUNCTION(PFNEGLQUERYDMABUFFORMATSEXTPROC, eglQueryDmaBufFormatsEXT)
+  LOOKUP_FUNCTION(PFNEGLQUERYDMABUFMODIFIERSEXTPROC, eglQueryDmaBufModifiersEXT)
 
   if (!eglBindAPI(EGL_OPENGL_ES_API)) {
     LOG("Failed to bind egl api (%s)", EglErrorString(eglGetError()));
@@ -338,13 +349,8 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
 
   LOG("GL_EXTENSIONS: %s", gl_ext);
   if (!HasExtension(gl_ext, "GL_OES_EGL_image")) return NULL;
-  gpu_context->glEGLImageTargetTexture2DOES =
-      (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress(
-          "glEGLImageTargetTexture2DOES");
-  if (!gpu_context->glEGLImageTargetTexture2DOES) {
-    LOG("Failed to lookup glEGLImageTargetTexture2DOES function");
-    return NULL;
-  }
+  LOOKUP_FUNCTION(PFNGLEGLIMAGETARGETTEXTURE2DOESPROC,
+                  glEGLImageTargetTexture2DOES)
 
   gpu_context->program_luma =
       CreateGlProgram(_binary_vertex_glsl_start, _binary_vertex_glsl_end,
@@ -418,25 +424,137 @@ void GpuContextDestroy(struct GpuContext** gpu_context) {
   *gpu_context = NULL;
 }
 
+static void DumpEglImageParams(const EGLAttrib* attribs) {
+  for (; *attribs != EGL_NONE; attribs += 2) {
+    switch (attribs[0]) {
+      case EGL_HEIGHT:
+        LOG("\tEGL_HEIGHT: %ld", attribs[1]);
+        break;
+      case EGL_WIDTH:
+        LOG("\tEGL_WIDTH: %ld", attribs[1]);
+        break;
+      case EGL_LINUX_DRM_FOURCC_EXT:
+        LOG("\tEGL_LINUX_DRM_FOURCC_EXT: %.4s", (const char*)&attribs[1]);
+        break;
+      case EGL_DMA_BUF_PLANE0_FD_EXT:
+      case EGL_DMA_BUF_PLANE1_FD_EXT:
+      case EGL_DMA_BUF_PLANE2_FD_EXT:
+        LOG("\tEGL_DMA_BUF_PLANE%ld_FD_EXT: %ld",
+            (attribs[0] - EGL_DMA_BUF_PLANE0_FD_EXT) / 3, attribs[1]);
+        break;
+      case EGL_DMA_BUF_PLANE0_OFFSET_EXT:
+      case EGL_DMA_BUF_PLANE1_OFFSET_EXT:
+      case EGL_DMA_BUF_PLANE2_OFFSET_EXT:
+        LOG("\tEGL_DMA_BUF_PLANE%ld_OFFSET_EXT: %ld",
+            (attribs[0] - EGL_DMA_BUF_PLANE0_OFFSET_EXT) / 3, attribs[1]);
+        break;
+      case EGL_DMA_BUF_PLANE0_PITCH_EXT:
+      case EGL_DMA_BUF_PLANE1_PITCH_EXT:
+      case EGL_DMA_BUF_PLANE2_PITCH_EXT:
+        LOG("\tEGL_DMA_BUF_PLANE%ld_PITCH_EXT: %ld",
+            (attribs[0] - EGL_DMA_BUF_PLANE0_PITCH_EXT) / 3, attribs[1]);
+        break;
+      case EGL_DMA_BUF_PLANE3_FD_EXT:
+        LOG("\tEGL_DMA_BUF_PLANE3_FD_EXT: %ld", attribs[1]);
+        break;
+      case EGL_DMA_BUF_PLANE3_OFFSET_EXT:
+        LOG("\tEGL_DMA_BUF_PLANE3_OFFSET_EXT: %ld", attribs[1]);
+        break;
+      case EGL_DMA_BUF_PLANE3_PITCH_EXT:
+        LOG("\tEGL_DMA_BUF_PLANE3_PITCH_EXT: %ld", attribs[1]);
+        break;
+      case EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT:
+      case EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT:
+      case EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT:
+      case EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT:
+      case EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT:
+      case EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT:
+      case EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT:
+      case EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT:
+        LOG("\tEGL_DMA_BUF_PLANE%ld_MODIFIER_%s_EXT: 0x%08lx",
+            (attribs[0] - EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT) / 2,
+            attribs[0] & 1 ? "LO" : "HI", attribs[1]);
+        break;
+    }
+  }
+}
+
+static bool IsFourccSupported(struct GpuContext* gpu_context, uint32_t fourcc) {
+  EGLint num_formats;
+  if (!gpu_context->eglQueryDmaBufFormatsEXT(gpu_context->display, 0, NULL,
+                                             &num_formats)) {
+    LOG("Faield to get number of supported dmabuf formats (%s)",
+        EglErrorString(eglGetError()));
+    return false;
+  }
+  EGLint formats[num_formats];
+  if (!gpu_context->eglQueryDmaBufFormatsEXT(gpu_context->display, num_formats,
+                                             formats, &num_formats)) {
+    LOG("Failed to get supported dmabuf formats (%s)",
+        EglErrorString(eglGetError()));
+    return false;
+  }
+  for (int i = 0; i < num_formats; i++) {
+    if ((uint32_t)formats[i] == fourcc) return true;
+  }
+  LOG("Format %.4s is unsupported by egl", (const char*)&fourcc);
+  LOG("Supported formats are:");
+  for (int i = 0; i < num_formats; i++) {
+    LOG("\t%.4s", (const char*)&formats[i]);
+  }
+  return false;
+}
+
+static bool IsModifierSupported(struct GpuContext* gpu_context, uint32_t fourcc,
+                                uint64_t modifier) {
+  EGLint num_modifiers;
+  if (!gpu_context->eglQueryDmaBufModifiersEXT(
+          gpu_context->display, (GLint)fourcc, 0, NULL, NULL, &num_modifiers)) {
+    LOG("Failed to get number of supported dmabuf modifiers (%s)",
+        EglErrorString(eglGetError()));
+    return false;
+  }
+  EGLuint64KHR modifiers[num_modifiers];
+  EGLBoolean external_only[num_modifiers];
+  if (!gpu_context->eglQueryDmaBufModifiersEXT(
+          gpu_context->display, (GLint)fourcc, num_modifiers, modifiers,
+          external_only, &num_modifiers)) {
+    LOG("Failed to get supported dmabuf modifiers (%s)",
+        EglErrorString(eglGetError()));
+    return false;
+  }
+  for (int i = 0; i < num_modifiers; i++) {
+    if (modifiers[i] == modifier && !external_only[i]) return true;
+  }
+  LOG("Modifier 0x%016lx for format %.4s is unsupported by egl", modifier,
+      (const char*)&fourcc);
+  LOG("Supported modifiers for format %.4s are:", (const char*)&fourcc);
+  for (int i = 0; i < num_modifiers; i++) {
+    LOG("\t0x%016lx%s", modifiers[i],
+        external_only[i] ? " (external only)" : "");
+  }
+  return false;
+}
+
 static EGLImage CreateEglImage(struct GpuContext* gpu_context, uint32_t width,
                                uint32_t height, uint32_t fourcc, size_t nplanes,
                                const struct GpuFramePlane* planes) {
   static const EGLAttrib attrib_keys[] = {
       EGL_DMA_BUF_PLANE0_FD_EXT,          EGL_DMA_BUF_PLANE0_OFFSET_EXT,
-      EGL_DMA_BUF_PLANE0_PITCH_EXT,       EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
-      EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_FD_EXT,
+      EGL_DMA_BUF_PLANE0_PITCH_EXT,       EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+      EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE1_FD_EXT,
       EGL_DMA_BUF_PLANE1_OFFSET_EXT,      EGL_DMA_BUF_PLANE1_PITCH_EXT,
-      EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+      EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT,
       EGL_DMA_BUF_PLANE2_FD_EXT,          EGL_DMA_BUF_PLANE2_OFFSET_EXT,
-      EGL_DMA_BUF_PLANE2_PITCH_EXT,       EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT,
-      EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_FD_EXT,
+      EGL_DMA_BUF_PLANE2_PITCH_EXT,       EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
+      EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE3_FD_EXT,
       EGL_DMA_BUF_PLANE3_OFFSET_EXT,      EGL_DMA_BUF_PLANE3_PITCH_EXT,
-      EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
+      EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT,
   };
 
   EGLAttrib attrib_list[7 + LENGTH(attrib_keys) * 2] = {
-      _(EGL_WIDTH, width),
       _(EGL_HEIGHT, height),
+      _(EGL_WIDTH, width),
       _(EGL_LINUX_DRM_FOURCC_EXT, fourcc),
   };
 
@@ -451,17 +569,29 @@ static EGLImage CreateEglImage(struct GpuContext* gpu_context, uint32_t width,
     *pairs++ = *key++;
     *pairs++ = planes[i].pitch;
     *pairs++ = *key++;
-    *pairs++ = planes[i].modifier >> 32;
-    *pairs++ = *key++;
     *pairs++ = planes[i].modifier & UINT32_MAX;
+    *pairs++ = *key++;
+    *pairs++ = planes[i].modifier >> 32;
   }
 
   *pairs = EGL_NONE;
+  if (!IsFourccSupported(gpu_context, fourcc)) goto failure;
+  for (size_t i = 0; i < nplanes; i++) {
+    if (!IsModifierSupported(gpu_context, fourcc, planes[i].modifier))
+      goto failure;
+  }
   EGLImage image = eglCreateImage(gpu_context->display, EGL_NO_CONFIG_KHR,
                                   EGL_LINUX_DMA_BUF_EXT, NULL, attrib_list);
-  if (image == EGL_NO_IMAGE)
+  if (image == EGL_NO_IMAGE) {
     LOG("Failed to create egl image (%s)", EglErrorString(eglGetError()));
+    goto failure;
+  }
   return image;
+
+failure:
+  LOG("Attributes list for failed egl image:");
+  DumpEglImageParams(attrib_list);
+  return EGL_NO_IMAGE;
 }
 
 static GLuint CreateTexture(struct GpuContext* gpu_context, EGLImage image) {
