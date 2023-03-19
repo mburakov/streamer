@@ -16,27 +16,26 @@
  */
 
 uniform sampler2D img_input;
-uniform mediump vec2 chroma_offsets;
+uniform mediump vec2 sample_offsets[4];
+uniform mediump mat3 colorspace;
+uniform mediump vec3 ranges[2];
 
 varying mediump vec2 texcoord;
 
-mediump vec2 rgb2chroma(in mediump vec4 rgb) {
-  // mburakov: This hardcodes BT.709 full-range.
-  mediump float y = rgb.r * 0.2126 + rgb.g * 0.7152 + rgb.b * 0.0722;
-  mediump float u = (rgb.b - y) / (2.0 * (1.0 - 0.0722));
-  mediump float v = (rgb.r - y) / (2.0 * (1.0 - 0.2126));
-  return vec2(u + 0.5, v + 0.5);
+mediump vec4 supersample() {
+  return texture2D(img_input, texcoord + sample_offsets[0]) +
+         texture2D(img_input, texcoord + sample_offsets[1]) +
+         texture2D(img_input, texcoord + sample_offsets[2]) +
+         texture2D(img_input, texcoord + sample_offsets[3]);
+}
+
+mediump vec3 rgb2yuv(in mediump vec3 rgb) {
+  mediump vec3 yuv = colorspace * rgb.rgb + vec3(0.0, 0.5, 0.5);
+  return ranges[0] + yuv * ranges[1];
 }
 
 void main() {
-  mediump vec2 sample_points[4];
-  sample_points[0] = texcoord;
-  sample_points[1] = texcoord + vec2(chroma_offsets.x, 0.0);
-  sample_points[2] = texcoord + vec2(0.0, chroma_offsets.y);
-  sample_points[3] = texcoord + chroma_offsets;
-  mediump vec4 rgb = texture2D(img_input, sample_points[0]) +
-                     texture2D(img_input, sample_points[1]) +
-                     texture2D(img_input, sample_points[2]) +
-                     texture2D(img_input, sample_points[3]);
-  gl_FragColor = vec4(rgb2chroma(rgb / 4.0), 0.0, 1.0);
+  mediump vec4 rgb = supersample() / 4.0;
+  mediump vec3 yuv = rgb2yuv(rgb.rgb);
+  gl_FragColor = vec4(yuv.yz, 0.0, 1.0);
 }

@@ -77,8 +77,33 @@ static bool SetHwFramesContext(struct EncodeContext* encode_context, int width,
   return true;
 }
 
+static enum AVColorSpace ConvertColorspace(enum YuvColorspace colorspace) {
+  switch (colorspace) {
+    case kItuRec601:
+      // TODO(mburakov): No dedicated definition for BT601?
+      return AVCOL_SPC_SMPTE170M;
+    case kItuRec709:
+      return AVCOL_SPC_BT709;
+    default:
+      __builtin_unreachable();
+  }
+}
+
+static enum AVColorRange ConvertRange(enum YuvRange range) {
+  switch (range) {
+    case kNarrowRange:
+      return AVCOL_RANGE_MPEG;
+    case kFullRange:
+      return AVCOL_RANGE_JPEG;
+    default:
+      __builtin_unreachable();
+  }
+}
+
 struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
-                                          uint32_t width, uint32_t height) {
+                                          uint32_t width, uint32_t height,
+                                          enum YuvColorspace colrospace,
+                                          enum YuvRange range) {
   struct AUTO(EncodeContext)* encode_context =
       malloc(sizeof(struct EncodeContext));
   if (!encode_context) {
@@ -119,8 +144,8 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
   encode_context->codec_context->max_b_frames = 0;
   encode_context->codec_context->refs = 1;
   encode_context->codec_context->global_quality = 18;
-  encode_context->codec_context->colorspace = AVCOL_SPC_BT709;
-  encode_context->codec_context->color_range = AVCOL_RANGE_JPEG;
+  encode_context->codec_context->colorspace = ConvertColorspace(colrospace);
+  encode_context->codec_context->color_range = ConvertRange(range);
 
   if (!SetHwFramesContext(encode_context, (int)width, (int)height)) {
     LOG("Failed to set hwframes context");

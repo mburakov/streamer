@@ -22,6 +22,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "colorspace.h"
+
 struct GpuFramePlane {
   int dmabuf_fd;
   uint32_t pitch;
@@ -29,7 +31,8 @@ struct GpuFramePlane {
   uint64_t modifier;
 };
 
-struct GpuContext* GpuContextCreate(void);
+struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
+                                    enum YuvRange range);
 bool GpuContextSync(struct GpuContext* gpu_context);
 void GpuContextDestroy(struct GpuContext** gpu_context);
 

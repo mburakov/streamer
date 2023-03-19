@@ -16,15 +16,18 @@
  */
 
 uniform sampler2D img_input;
+uniform mediump mat3 colorspace;
+uniform mediump vec3 ranges[2];
 
 varying mediump vec2 texcoord;
 
-mediump float rgb2luma(in mediump vec4 rgb) {
-  // mburakov: This hardcodes BT.709 full-range.
-  return rgb.r * 0.2126 + rgb.g * 0.7152 + rgb.b * 0.0722;
+mediump vec3 rgb2yuv(in mediump vec3 rgb) {
+  mediump vec3 yuv = colorspace * rgb.rgb + vec3(0.0, 0.5, 0.5);
+  return ranges[0] + yuv * ranges[1];
 }
 
 void main() {
   mediump vec4 rgb = texture2D(img_input, texcoord);
-  gl_FragColor = vec4(rgb2luma(rgb), 0.0, 0.0, 1.0);
+  mediump vec3 yuv = rgb2yuv(rgb.rgb);
+  gl_FragColor = vec4(yuv.x, 0.0, 0.0, 1.0);
 }

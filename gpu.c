@@ -56,7 +56,7 @@ struct GpuContext {
   PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
   GLuint program_luma;
   GLuint program_chroma;
-  GLint chroma_offsets;
+  GLint sample_offsets;
   GLuint framebuffer;
   GLuint vertices;
 };
@@ -179,15 +179,71 @@ bail_out:
   return program;
 }
 
-static bool SetupImgInputUniform(GLuint program) {
-  GLint img_input = glGetUniformLocation(program, "img_input");
-  if (img_input == -1) {
-    LOG("Failed to find img_input uniform (%s)", GlErrorString(glGetError()));
-    return false;
+static const GLfloat* GetColorspaceMatrix(enum YuvColorspace colorspace) {
+  static const GLfloat rec601[] = {
+      _(0.299f, 0.587f, 0.114f),
+      _(-0.168736f, -0.331264f, 0.5f),
+      _(0.5f, -0.418688f, -0.081312f),
+  };
+  static const GLfloat rec709[] = {
+      _(0.2126f, 0.7152f, 0.0722f),
+      _(-0.1146f, -0.3854f, 0.5f),
+      _(0.5f, -0.4542f, -0.0458f),
+  };
+  switch (colorspace) {
+    case kItuRec601:
+      return rec601;
+    case kItuRec709:
+      return rec709;
+    default:
+      __builtin_unreachable();
+  }
+}
+
+static const GLfloat* GetRangeVectors(enum YuvRange range) {
+  static const GLfloat narrow[] = {
+      _(16.f / 255.f, 16.f / 255.f, 16.f / 255.f),
+      _((235.f - 16.f) / 255.f, (240.f - 16.f) / 255.f, (240.f - 16.f) / 255.f),
+  };
+  static const GLfloat full[] = {
+      _(0.f, 0.f, 0.f),
+      _(1.f, 1.f, 1.f),
+  };
+  switch (range) {
+    case kNarrowRange:
+      return narrow;
+    case kFullRange:
+      return full;
+    default:
+      __builtin_unreachable();
+  }
+}
+
+static bool SetupCommonUniforms(GLuint program, enum YuvColorspace colorspace,
+                                enum YuvRange range) {
+  struct {
+    const char* name;
+    GLint location;
+  } uniforms[] = {
+      {.name = "img_input"},
+      {.name = "colorspace"},
+      {.name = "ranges"},
+  };
+
+  for (size_t i = 0; i < LENGTH(uniforms); i++) {
+    uniforms[i].location = glGetUniformLocation(program, uniforms[i].name);
+    if (uniforms[i].location == -1) {
+      LOG("Failed to locate %s uniform (%s)", uniforms[i].name,
+          GlErrorString(glGetError()));
+      return false;
+    }
   }
 
   glUseProgram(program);
-  glUniform1i(img_input, 0);
+  glUniform1i(uniforms[0].location, 0);
+  glUniformMatrix3fv(uniforms[1].location, 1, GL_TRUE,
+                     GetColorspaceMatrix(colorspace));
+  glUniform3fv(uniforms[2].location, 2, GetRangeVectors(range));
   GLenum error = glGetError();
   if (error != GL_NO_ERROR) {
     LOG("Failed to set img_input uniform (%s)", GlErrorString(glGetError()));
@@ -196,7 +252,8 @@ static bool SetupImgInputUniform(GLuint program) {
   return true;
 }
 
-struct GpuContext* GpuContextCreate(void) {
+struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
+                                    enum YuvRange range) {
   struct AUTO(GpuContext)* gpu_context = malloc(sizeof(struct GpuContext));
   if (!gpu_context) {
     LOG("Failed to allocate gpu context (%s)", strerror(errno));
@@ -208,7 +265,7 @@ struct GpuContext* GpuContextCreate(void) {
       .glEGLImageTargetTexture2DOES = NULL,
       .program_luma = 0,
       .program_chroma = 0,
-      .chroma_offsets = -1,
+      .sample_offsets = -1,
       .framebuffer = 0,
       .vertices = 0,
   };
@@ -255,11 +312,9 @@ struct GpuContext* GpuContextCreate(void) {
   }
 
   static const EGLint context_attribs[] = {
-#define _(...) __VA_ARGS__
       _(EGL_CONTEXT_MAJOR_VERSION, 3),
       _(EGL_CONTEXT_MINOR_VERSION, 1),
       EGL_NONE,
-#undef _
   };
   gpu_context->context = eglCreateContext(
       gpu_context->display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, context_attribs);
@@ -295,7 +350,7 @@ struct GpuContext* GpuContextCreate(void) {
       CreateGlProgram(_binary_vertex_glsl_start, _binary_vertex_glsl_end,
                       _binary_luma_glsl_start, _binary_luma_glsl_end);
   if (!gpu_context->program_luma ||
-      !SetupImgInputUniform(gpu_context->program_luma)) {
+      !SetupCommonUniforms(gpu_context->program_luma, colorspace, range)) {
     LOG("Failed to create luma program");
     return NULL;
   }
@@ -304,14 +359,14 @@ struct GpuContext* GpuContextCreate(void) {
       CreateGlProgram(_binary_vertex_glsl_start, _binary_vertex_glsl_end,
                       _binary_chroma_glsl_start, _binary_chroma_glsl_end);
   if (!gpu_context->program_chroma ||
-      !SetupImgInputUniform(gpu_context->program_luma)) {
+      !SetupCommonUniforms(gpu_context->program_chroma, colorspace, range)) {
     LOG("Failed to create chroma program");
     return NULL;
   }
-  gpu_context->chroma_offsets =
-      glGetUniformLocation(gpu_context->program_chroma, "chroma_offsets");
-  if (gpu_context->chroma_offsets == -1) {
-    LOG("Failed to find chroma_offsets uniform (%s)",
+  gpu_context->sample_offsets =
+      glGetUniformLocation(gpu_context->program_chroma, "sample_offsets");
+  if (gpu_context->sample_offsets == -1) {
+    LOG("Failed to find sample_offsets uniform (%s)",
         GlErrorString(glGetError()));
     return NULL;
   }
@@ -380,11 +435,9 @@ static EGLImage CreateEglImage(struct GpuContext* gpu_context, uint32_t width,
   };
 
   EGLAttrib attrib_list[7 + LENGTH(attrib_keys) * 2] = {
-#define _(...) __VA_ARGS__
       _(EGL_WIDTH, width),
       _(EGL_HEIGHT, height),
       _(EGL_LINUX_DRM_FOURCC_EXT, fourcc),
-#undef _
   };
 
   EGLAttrib* pairs = &attrib_list[6];
@@ -533,9 +586,15 @@ bool GpuFrameConvert(const struct GpuFrame* from, const struct GpuFrame* to) {
     return false;
   }
 
+  const GLfloat sample_offsets[] = {
+      _(0.f, 0.f),
+      _(1.f / (GLfloat)from->width, 0.f),
+      _(0.f, 1.f / (GLfloat)from->height),
+      _(1.f / (GLfloat)from->width, 1.f / (GLfloat)from->height),
+  };
+
   glUseProgram(from->gpu_context->program_chroma);
-  glUniform2f(from->gpu_context->chroma_offsets, 1.f / (GLfloat)from->width,
-              1.f / (GLfloat)from->height);
+  glUniform2fv(from->gpu_context->sample_offsets, 4, sample_offsets);
   glViewport(0, 0, (GLsizei)to->width / 2, (GLsizei)to->height / 2);
   if (!GpuFrameConvertImpl(from->textures[0], to->textures[1])) {
     LOG("Failed to convert chroma plane");

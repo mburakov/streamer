@@ -25,9 +25,17 @@
 #include <unistd.h>
 
 #include "capture.h"
+#include "colorspace.h"
 #include "encode.h"
 #include "gpu.h"
 #include "util.h"
+
+// TODO(mburakov): Currently zwp_linux_dmabuf_v1 has no way to provide
+// colorspace and range information to the compositor. Maybe this would change
+// in the future, i.e keep an eye on color-representation Wayland protocol:
+// https://gitlab.freedesktop.org/wayland/wayland-protocols/-/merge_requests/183
+static const enum YuvColorspace colorspace = kItuRec601;
+static const enum YuvRange range = kNarrowRange;
 
 static volatile sig_atomic_t g_signal;
 static void OnSignal(int status) { g_signal = status; }
@@ -69,7 +77,7 @@ int main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
 
-  struct AUTO(GpuContext)* gpu_context = GpuContextCreate();
+  struct AUTO(GpuContext)* gpu_context = GpuContextCreate(colorspace, range);
   if (!gpu_context) {
     LOG("Failed to create gpu context");
     return EXIT_FAILURE;
@@ -104,7 +112,8 @@ int main(int argc, char* argv[]) {
     if (!encode_context) {
       uint32_t width, height;
       GpuFrameGetSize(captured_frame, &width, &height);
-      encode_context = EncodeContextCreate(gpu_context, width, height);
+      encode_context =
+          EncodeContextCreate(gpu_context, width, height, colorspace, range);
       if (!encode_context) {
         LOG("Failed to create encode context");
         return EXIT_FAILURE;

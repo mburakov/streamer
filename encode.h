@@ -21,12 +21,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "colorspace.h"
+
 struct EncodeContext;
 struct GpuContext;
 struct GpuFrame;
 
 struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
-                                          uint32_t width, uint32_t height);
+                                          uint32_t width, uint32_t height,
+                                          enum YuvColorspace colorspace,
+                                          enum YuvRange range);
 const struct GpuFrame* EncodeContextGetFrame(
     struct EncodeContext* encode_context);
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd);

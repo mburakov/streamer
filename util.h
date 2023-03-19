@@ -27,6 +27,7 @@
 #define LENGTH(x) (sizeof(x) / sizeof *(x))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define _(...) __VA_ARGS__
 
 static inline void* Release(void** x) {
   void* result = *x;
