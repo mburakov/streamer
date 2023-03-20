@@ -23,16 +23,18 @@
 #include <GLES3/gl32.h>
 #include <drm_fourcc.h>
 #include <errno.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-// Must be included last
+// mburakov: Must be included after GLES2/gl2.h
 #include <GLES2/gl2ext.h>
+
+#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
+#include <fcntl.h>
+#include <gbm.h>
+#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
 
 #include "util.h"
 
@@ -58,6 +60,10 @@ extern const char _binary_chroma_glsl_start[];
 extern const char _binary_chroma_glsl_end[];
 
 struct GpuContext {
+#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
+  int render_node;
+  struct gbm_device* device;
+#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
   EGLDisplay display;
   EGLContext context;
   PFNEGLQUERYDMABUFFORMATSEXTPROC eglQueryDmaBufFormatsEXT;
@@ -269,14 +275,12 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
     return NULL;
   }
   *gpu_context = (struct GpuContext){
+#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
+      .render_node = -1,
+#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
       .display = EGL_NO_DISPLAY,
       .context = EGL_NO_CONTEXT,
-      .glEGLImageTargetTexture2DOES = NULL,
-      .program_luma = 0,
-      .program_chroma = 0,
       .sample_offsets = -1,
-      .framebuffer = 0,
-      .vertices = 0,
   };
 
   const char* egl_ext = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
@@ -287,9 +291,30 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
   }
 
   LOG("EGL_EXTENSIONS: %s", egl_ext);
+  // TODO(mburakov): Quite surprisingly EGL_MESA_platform_surfaceless does not
+  // provide support for AMD_FMT_MOD_TILE_VER_GFX11 dmabuf modifier on my AMD
+  // system. For comparison, on my Intel system all the modifiers ever found on
+  // framebuffers are reported as supported by EGL. Maybe that's because the
+  // support for RDNA3 is still quite young in MESA.
+#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
+  if (!HasExtension(egl_ext, "EGL_MESA_platform_gbm")) return NULL;
+  gpu_context->render_node = open("/dev/dri/renderD128", O_RDWR);
+  if (gpu_context->render_node == -1) {
+    LOG("Failed to open render node (%s)", strerror(errno));
+    return NULL;
+  }
+  gpu_context->device = gbm_create_device(gpu_context->render_node);
+  if (!gpu_context->device) {
+    LOG("Failed to create gbm device (%s)", strerror(errno));
+    return NULL;
+  }
+  gpu_context->display =
+      eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, gpu_context->device, NULL);
+#else   // USE_EGL_MESA_PLATFORM_SURFACELESS
   if (!HasExtension(egl_ext, "EGL_MESA_platform_surfaceless")) return NULL;
   gpu_context->display =
       eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
+#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
   if (gpu_context->display == EGL_NO_DISPLAY) {
     LOG("Failed to get egl display (%s)", EglErrorString(eglGetError()));
     return NULL;
@@ -420,6 +445,10 @@ void GpuContextDestroy(struct GpuContext** gpu_context) {
   }
   if ((*gpu_context)->display != EGL_NO_DISPLAY)
     eglTerminate((*gpu_context)->display);
+#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
+  if ((*gpu_context)->device) gbm_device_destroy((*gpu_context)->device);
+  if ((*gpu_context)->render_node != -1) close((*gpu_context)->render_node);
+#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
   free(*gpu_context);
   *gpu_context = NULL;
 }

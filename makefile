@@ -4,6 +4,7 @@ obj:=$(src:.c=.o)
 
 libs:=\
 	egl \
+	gbm \
 	glesv2 \
 	libavcodec \
 	libavutil \
@@ -15,7 +16,7 @@ res:=\
 	luma.glsl \
 	chroma.glsl
 
-
+#CFLAGS+=-DUSE_EGL_MESA_PLATFORM_SURFACELESS
 CFLAGS+=$(shell pkg-config --cflags $(libs))
 LDFLAGS+=$(shell pkg-config --libs $(libs))
 
