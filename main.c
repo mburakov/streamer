@@ -16,18 +16,17 @@
  */
 
 #include <errno.h>
-#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "capture.h"
 #include "colorspace.h"
 #include "encode.h"
 #include "gpu.h"
+#include "perf.h"
 #include "util.h"
 
 // TODO(mburakov): Currently zwp_linux_dmabuf_v1 has no way to provide
@@ -39,32 +38,6 @@ static const enum YuvRange range = kNarrowRange;
 
 static volatile sig_atomic_t g_signal;
 static void OnSignal(int status) { g_signal = status; }
-
-struct TimingStats {
-  unsigned long long min;
-  unsigned long long max;
-  unsigned long long sum;
-};
-
-static void TimingStatsRecord(struct TimingStats* timing_stats,
-                              unsigned long long value) {
-  timing_stats->min = MIN(timing_stats->min, value);
-  timing_stats->max = MAX(timing_stats->max, value);
-  timing_stats->sum += value;
-}
-
-static void TimingStatsLog(const struct TimingStats* timing_stats,
-                           const char* name, unsigned long long counter) {
-  LOG("%s min/avg/max: %llu/%llu/%llu", name, timing_stats->min,
-      timing_stats->sum / counter, timing_stats->max);
-}
-
-static unsigned long long MicrosNow(void) {
-  struct timespec ts = {.tv_sec = 0, .tv_nsec = 0};
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (unsigned long long)ts.tv_sec * 1000000ull +
-         (unsigned long long)ts.tv_nsec / 1000ull;
-}
 
 int main(int argc, char* argv[]) {
   (void)argc;
@@ -92,12 +65,19 @@ int main(int argc, char* argv[]) {
 
   struct AUTO(EncodeContext)* encode_context = NULL;
 
-  struct TimingStats capture = {.min = ULLONG_MAX};
-  struct TimingStats convert = {.min = ULLONG_MAX};
-  struct TimingStats encode = {.min = ULLONG_MAX};
-  struct TimingStats total = {.min = ULLONG_MAX};
+  struct TimingStats capture;
+  struct TimingStats convert;
+  struct TimingStats encode;
+  struct TimingStats drain;
+  struct TimingStats total;
+  TimingStatsReset(&capture);
+  TimingStatsReset(&convert);
+  TimingStatsReset(&encode);
+  TimingStatsReset(&drain);
+  TimingStatsReset(&total);
   unsigned long long num_frames = 0;
 
+  unsigned long long recording_started = MicrosNow();
   static const unsigned long long delta = 1000000ull / 60ull;
   for (unsigned long long next = MicrosNow() + delta; !g_signal;
        next += delta) {
@@ -135,32 +115,44 @@ int main(int argc, char* argv[]) {
 
     GpuContextSync(gpu_context);
     unsigned long long before_encode = MicrosNow();
-    if (!EncodeContextEncodeFrame(encode_context, STDOUT_FILENO)) {
+    if (!EncodeContextEncodeFrame(encode_context, STDOUT_FILENO, &encode,
+                                  &drain)) {
       LOG("Failed to encode frame");
       return EXIT_FAILURE;
     }
 
     unsigned long long now = MicrosNow();
-    if (num_frames++) {
-      // mburakov: Do not record stats for first (lazy) frame.
-      TimingStatsRecord(&capture, before_convert - before_capture);
-      TimingStatsRecord(&convert, before_encode - before_convert);
-      TimingStatsRecord(&encode, now - before_encode);
-      TimingStatsRecord(&total, now - before_capture);
+    TimingStatsRecord(&capture, before_convert - before_capture);
+    TimingStatsRecord(&convert, before_encode - before_convert);
+    TimingStatsRecord(&total, now - before_capture);
+
+    unsigned long long period = now - recording_started;
+    static const unsigned long long second = 1000000;
+    if (period > 10 * second) {
+      LOG("---->8-------->8-------->8----");
+      TimingStatsLog(&capture, "Capture", num_frames);
+      TimingStatsLog(&convert, "Convert", num_frames);
+      TimingStatsLog(&encode, "Encode", num_frames);
+      TimingStatsLog(&drain, "Drain", num_frames);
+      TimingStatsLog(&total, "Total", num_frames);
+      TimingStatsReset(&capture);
+      TimingStatsReset(&convert);
+      TimingStatsReset(&encode);
+      TimingStatsReset(&drain);
+      TimingStatsReset(&total);
+      recording_started = now;
+      num_frames = 0;
     }
+
+    now = MicrosNow();
     unsigned long long micros = now < next ? next - now : 0;
     if (micros) usleep((unsigned)micros);
+    num_frames++;
   }
 
-  if (!EncodeContextEncodeFrame(encode_context, STDOUT_FILENO)) {
+  if (!EncodeContextEncodeFrame(encode_context, STDOUT_FILENO, NULL, NULL)) {
     LOG("Failed to drain encoder");
     return EXIT_FAILURE;
   }
-
-  num_frames--;
-  TimingStatsLog(&capture, "Capture", num_frames);
-  TimingStatsLog(&convert, "Convert", num_frames);
-  TimingStatsLog(&encode, "Encode", num_frames);
-  TimingStatsLog(&total, "Total", num_frames);
   return EXIT_SUCCESS;
 }

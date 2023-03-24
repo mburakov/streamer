@@ -31,6 +31,7 @@
 #include <va/va_drmcommon.h>
 
 #include "gpu.h"
+#include "perf.h"
 #include "util.h"
 
 #define AVBufferRefDestroy av_buffer_unref
@@ -125,9 +126,10 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
     return NULL;
   }
 
-  const AVCodec* codec = avcodec_find_encoder_by_name("h264_vaapi");
+  static const char codec_name[] = "h264_vaapi";
+  const AVCodec* codec = avcodec_find_encoder_by_name(codec_name);
   if (!codec) {
-    LOG("Failed to find h264_vaapi encoder");
+    LOG("Failed to find %s encoder", codec_name);
     return NULL;
   }
 
@@ -143,7 +145,7 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
   encode_context->codec_context->pix_fmt = AV_PIX_FMT_VAAPI;
   encode_context->codec_context->max_b_frames = 0;
   encode_context->codec_context->refs = 1;
-  encode_context->codec_context->global_quality = 18;
+  encode_context->codec_context->global_quality = 32;
   encode_context->codec_context->colorspace = ConvertColorspace(colrospace);
   encode_context->codec_context->color_range = ConvertRange(range);
 
@@ -250,7 +252,10 @@ static bool DrainPacket(const struct AVPacket* packet, int fd) {
   }
 }
 
-bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
+bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
+                              struct TimingStats* encode,
+                              struct TimingStats* drain) {
+  unsigned long long before_send = MicrosNow();
   GpuFrameDestroy(&encode_context->gpu_frame);
   AUTO(AVFrame)* hw_frame = RELEASE(encode_context->hw_frame);
   AUTO(AVPacket)* packet = av_packet_alloc();
@@ -265,13 +270,20 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     return false;
   }
 
+  unsigned long long total_send = MicrosNow() - before_send;
+  unsigned long long total_receive = 0;
+  unsigned long long total_drain = 0;
   for (;;) {
+    unsigned long long before_receive = MicrosNow();
     err = avcodec_receive_packet(encode_context->codec_context, packet);
     switch (err) {
       case 0:
         break;
       case AVERROR(EAGAIN):
       case AVERROR_EOF:
+        total_receive += MicrosNow() - before_receive;
+        if (encode) TimingStatsRecord(encode, total_send + total_receive);
+        if (drain) TimingStatsRecord(drain, total_drain);
         return true;
       default:
         LOG("Failed to receive packet (%s)", av_err2str(err));
@@ -279,12 +291,16 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     }
 
     packet->stream_index = 0;
+    unsigned long long before_drain = MicrosNow();
     bool result = DrainPacket(packet, fd);
     av_packet_unref(packet);
     if (!result) {
       LOG("Failed to write full packet (%s)", strerror(errno));
       return false;
     }
+
+    total_receive += before_drain - before_receive;
+    total_drain += MicrosNow() - before_drain;
   }
 }
 
