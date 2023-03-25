@@ -29,9 +29,17 @@
 #include "gpu.h"
 #include "util.h"
 
-struct CaptureContext {
-  int drm_fd;
+struct Framebuffer {
+  uint32_t framebuffer_id;
   struct GpuFrame* gpu_frame;
+};
+
+struct CaptureContext {
+  struct GpuContext* gpu_context;
+  int drm_fd;
+  uint32_t crtc_id;
+  size_t framebuffers_count;
+  struct Framebuffer* framebuffers;
 };
 
 static int OpenAnyModule(void) {
@@ -61,6 +69,64 @@ static void drmModeCrtcPtrDestroy(drmModeCrtcPtr* crtc) {
 
 static void drmModeFB2PtrDestroy(drmModeFB2Ptr* fb2) {
   if (fb2 && *fb2) drmModeFreeFB2(*fb2);
+}
+
+static bool IsCrtcComplete(int drm_fd, uint32_t crtc_id) {
+  AUTO(drmModeCrtcPtr)
+  crtc = drmModeGetCrtc(drm_fd, crtc_id);
+  if (!crtc) {
+    LOG("Failed to get crtc %u", crtc_id);
+    return false;
+  }
+  if (!crtc->buffer_id) {
+    LOG("Crtc %u has no framebuffer", crtc_id);
+    return false;
+  }
+
+  AUTO(drmModeFB2Ptr)
+  fb2 = drmModeGetFB2(drm_fd, crtc->buffer_id);
+  if (!fb2) {
+    LOG("Failed to get framebuffer %u", crtc->buffer_id);
+    return false;
+  }
+  if (!fb2->handles[0]) {
+    LOG("Framebuffer %u has no handles", crtc->buffer_id);
+    return false;
+  }
+  return true;
+}
+
+struct CaptureContext* CaptureContextCreate(struct GpuContext* gpu_context) {
+  struct AUTO(CaptureContext)* capture_context =
+      malloc(sizeof(struct CaptureContext));
+  if (!capture_context) {
+    LOG("Failed to allocate capture context (%s)", strerror(errno));
+    return NULL;
+  }
+  *capture_context = (struct CaptureContext){
+      .gpu_context = gpu_context,
+      .drm_fd = -1,
+  };
+
+  capture_context->drm_fd = OpenAnyModule();
+  if (capture_context->drm_fd == -1) return NULL;
+
+  AUTO(drmModeResPtr) res = drmModeGetResources(capture_context->drm_fd);
+  if (!res) {
+    LOG("Failed to get drm mode resources (%s)", strerror(errno));
+    return NULL;
+  }
+
+  for (int i = 0; i < res->count_crtcs; i++) {
+    if (IsCrtcComplete(capture_context->drm_fd, res->crtcs[i])) {
+      LOG("Capturing crtc %u", res->crtcs[i]);
+      capture_context->crtc_id = res->crtcs[i];
+      return RELEASE(capture_context);
+    }
+  }
+
+  LOG("Nothing to capture");
+  return NULL;
 }
 
 static struct GpuFrame* WrapFramebuffer(int drm_fd, drmModeFB2Ptr fb2,
@@ -93,19 +159,23 @@ release_planes:
   return result;
 }
 
-static struct GpuFrame* GrabCrtc(int drm_fd, uint32_t crtc_id,
-                                 struct GpuContext* gpu_context) {
-  AUTO(drmModeCrtcPtr) crtc = drmModeGetCrtc(drm_fd, crtc_id);
+const struct GpuFrame* CaptureContextGetFrame(
+    struct CaptureContext* capture_context) {
+  AUTO(drmModeCrtcPtr)
+  crtc = drmModeGetCrtc(capture_context->drm_fd, capture_context->crtc_id);
   if (!crtc) {
-    LOG("Failed to get crtc %u", crtc_id);
-    return NULL;
-  }
-  if (!crtc->buffer_id) {
-    LOG("Crtc %u has no framebuffer", crtc_id);
+    LOG("Failed to get crtc %u", capture_context->crtc_id);
     return NULL;
   }
 
-  AUTO(drmModeFB2Ptr) fb2 = drmModeGetFB2(drm_fd, crtc->buffer_id);
+  for (size_t i = 0; i < capture_context->framebuffers_count; i++) {
+    // TODO(mburakov): Verify nothing changed since last frame.
+    if (capture_context->framebuffers[i].framebuffer_id == crtc->buffer_id)
+      return capture_context->framebuffers[i].gpu_frame;
+  }
+
+  AUTO(drmModeFB2Ptr)
+  fb2 = drmModeGetFB2(capture_context->drm_fd, crtc->buffer_id);
   if (!fb2) {
     LOG("Failed to get framebuffer %u", crtc->buffer_id);
     return NULL;
@@ -115,51 +185,32 @@ static struct GpuFrame* GrabCrtc(int drm_fd, uint32_t crtc_id,
     return NULL;
   }
 
-  LOG("Capturing framebuffer %u on crtc %u", crtc->buffer_id, crtc_id);
-  return WrapFramebuffer(drm_fd, fb2, gpu_context);
-}
-
-struct CaptureContext* CaptureContextCreate(struct GpuContext* gpu_context) {
-  struct AUTO(CaptureContext)* capture_context =
-      malloc(sizeof(struct CaptureContext));
-  if (!capture_context) {
-    LOG("Failed to allocate capture context (%s)", strerror(errno));
+  struct AUTO(GpuFrame)* gpu_frame = WrapFramebuffer(
+      capture_context->drm_fd, fb2, capture_context->gpu_context);
+  if (!gpu_frame) return NULL;
+  size_t framebuffers_count = capture_context->framebuffers_count + 1;
+  struct Framebuffer* framebuffers =
+      realloc(capture_context->framebuffers,
+              framebuffers_count * sizeof(struct Framebuffer));
+  if (!framebuffers) {
+    LOG("Failed to reallocate framebuffers (%s)", strerror(errno));
     return NULL;
   }
-  *capture_context = (struct CaptureContext){
-      .drm_fd = -1,
-      .gpu_frame = NULL,
+
+  framebuffers[capture_context->framebuffers_count] = (struct Framebuffer){
+      .framebuffer_id = crtc->buffer_id,
+      .gpu_frame = gpu_frame,
   };
-
-  capture_context->drm_fd = OpenAnyModule();
-  if (capture_context->drm_fd == -1) return NULL;
-
-  AUTO(drmModeResPtr) res = drmModeGetResources(capture_context->drm_fd);
-  if (!res) {
-    LOG("Failed to get drm mode resources (%s)", strerror(errno));
-    return NULL;
-  }
-
-  for (int i = 0; i < res->count_crtcs; i++) {
-    capture_context->gpu_frame =
-        GrabCrtc(capture_context->drm_fd, res->crtcs[i], gpu_context);
-    if (capture_context->gpu_frame) return RELEASE(capture_context);
-  }
-
-  LOG("Nothing to capture");
-  return NULL;
-}
-
-const struct GpuFrame* CaptureContextGetFrame(
-    struct CaptureContext* capture_context) {
-  // TODO(mburakov): Verify nothing changed since last frame
-  return capture_context->gpu_frame;
+  capture_context->framebuffers_count = framebuffers_count;
+  capture_context->framebuffers = framebuffers;
+  return RELEASE(gpu_frame);
 }
 
 void CaptureContextDestroy(struct CaptureContext** capture_context) {
   if (!capture_context || !*capture_context) return;
-  if ((*capture_context)->gpu_frame)
-    GpuFrameDestroy(&(*capture_context)->gpu_frame);
+  for (size_t i = 0; i < (*capture_context)->framebuffers_count; i++)
+    GpuFrameDestroy(&(*capture_context)->framebuffers[i].gpu_frame);
+  if ((*capture_context)->framebuffers) free((*capture_context)->framebuffers);
   if ((*capture_context)->drm_fd != -1) drmClose((*capture_context)->drm_fd);
   free(*capture_context);
   capture_context = NULL;
