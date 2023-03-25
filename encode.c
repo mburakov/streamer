@@ -126,7 +126,7 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
     return NULL;
   }
 
-  static const char codec_name[] = "h264_vaapi";
+  static const char codec_name[] = "hevc_vaapi";
   const AVCodec* codec = avcodec_find_encoder_by_name(codec_name);
   if (!codec) {
     LOG("Failed to find %s encoder", codec_name);
