@@ -29,17 +29,11 @@
 #include "gpu.h"
 #include "util.h"
 
-struct Framebuffer {
-  uint32_t framebuffer_id;
-  struct GpuFrame* gpu_frame;
-};
-
 struct CaptureContext {
   struct GpuContext* gpu_context;
   int drm_fd;
   uint32_t crtc_id;
-  size_t framebuffers_count;
-  struct Framebuffer* framebuffers;
+  struct GpuFrame* gpu_frame;
 };
 
 static int OpenAnyModule(void) {
@@ -168,12 +162,6 @@ const struct GpuFrame* CaptureContextGetFrame(
     return NULL;
   }
 
-  for (size_t i = 0; i < capture_context->framebuffers_count; i++) {
-    // TODO(mburakov): Verify nothing changed since last frame.
-    if (capture_context->framebuffers[i].framebuffer_id == crtc->buffer_id)
-      return capture_context->framebuffers[i].gpu_frame;
-  }
-
   AUTO(drmModeFB2Ptr)
   fb2 = drmModeGetFB2(capture_context->drm_fd, crtc->buffer_id);
   if (!fb2) {
@@ -185,32 +173,16 @@ const struct GpuFrame* CaptureContextGetFrame(
     return NULL;
   }
 
-  struct AUTO(GpuFrame)* gpu_frame = WrapFramebuffer(
-      capture_context->drm_fd, fb2, capture_context->gpu_context);
-  if (!gpu_frame) return NULL;
-  size_t framebuffers_count = capture_context->framebuffers_count + 1;
-  struct Framebuffer* framebuffers =
-      realloc(capture_context->framebuffers,
-              framebuffers_count * sizeof(struct Framebuffer));
-  if (!framebuffers) {
-    LOG("Failed to reallocate framebuffers (%s)", strerror(errno));
-    return NULL;
-  }
-
-  framebuffers[capture_context->framebuffers_count] = (struct Framebuffer){
-      .framebuffer_id = crtc->buffer_id,
-      .gpu_frame = gpu_frame,
-  };
-  capture_context->framebuffers_count = framebuffers_count;
-  capture_context->framebuffers = framebuffers;
-  return RELEASE(gpu_frame);
+  GpuFrameDestroy(&capture_context->gpu_frame);
+  capture_context->gpu_frame = WrapFramebuffer(capture_context->drm_fd, fb2,
+                                               capture_context->gpu_context);
+  return capture_context->gpu_frame;
 }
 
 void CaptureContextDestroy(struct CaptureContext** capture_context) {
   if (!capture_context || !*capture_context) return;
-  for (size_t i = 0; i < (*capture_context)->framebuffers_count; i++)
-    GpuFrameDestroy(&(*capture_context)->framebuffers[i].gpu_frame);
-  if ((*capture_context)->framebuffers) free((*capture_context)->framebuffers);
+  if ((*capture_context)->gpu_frame)
+    GpuFrameDestroy(&(*capture_context)->gpu_frame);
   if ((*capture_context)->drm_fd != -1) drmClose((*capture_context)->drm_fd);
   free(*capture_context);
   capture_context = NULL;
