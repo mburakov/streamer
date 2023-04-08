@@ -53,45 +53,38 @@ static int OpenAnyModule(void) {
   return -1;
 }
 
-static void drmModeResPtrDestroy(drmModeResPtr* res) {
-  if (res && *res) drmModeFreeResources(*res);
-}
-
-static void drmModeCrtcPtrDestroy(drmModeCrtcPtr* crtc) {
-  if (crtc && *crtc) drmModeFreeCrtc(*crtc);
-}
-
-static void drmModeFB2PtrDestroy(drmModeFB2Ptr* fb2) {
-  if (fb2 && *fb2) drmModeFreeFB2(*fb2);
-}
-
 static bool IsCrtcComplete(int drm_fd, uint32_t crtc_id) {
-  AUTO(drmModeCrtcPtr)
-  crtc = drmModeGetCrtc(drm_fd, crtc_id);
+  drmModeCrtcPtr crtc = drmModeGetCrtc(drm_fd, crtc_id);
   if (!crtc) {
-    LOG("Failed to get crtc %u", crtc_id);
+    LOG("Failed to get crtc %u (%s)", crtc_id, strerror(errno));
     return false;
   }
+  bool result = false;
   if (!crtc->buffer_id) {
     LOG("Crtc %u has no framebuffer", crtc_id);
-    return false;
+    goto rollback_crtc;
   }
 
-  AUTO(drmModeFB2Ptr)
-  fb2 = drmModeGetFB2(drm_fd, crtc->buffer_id);
+  drmModeFB2Ptr fb2 = drmModeGetFB2(drm_fd, crtc->buffer_id);
   if (!fb2) {
-    LOG("Failed to get framebuffer %u", crtc->buffer_id);
-    return false;
+    LOG("Failed to get framebuffer %u (%s)", crtc->buffer_id, strerror(errno));
+    goto rollback_crtc;
   }
   if (!fb2->handles[0]) {
     LOG("Framebuffer %u has no handles", crtc->buffer_id);
-    return false;
+    goto rollback_fb2;
   }
-  return true;
+  result = true;
+
+rollback_fb2:
+  drmModeFreeFB2(fb2);
+rollback_crtc:
+  drmModeFreeCrtc(crtc);
+  return result;
 }
 
 struct CaptureContext* CaptureContextCreate(struct GpuContext* gpu_context) {
-  struct AUTO(CaptureContext)* capture_context =
+  struct CaptureContext* capture_context =
       malloc(sizeof(struct CaptureContext));
   if (!capture_context) {
     LOG("Failed to allocate capture context (%s)", strerror(errno));
@@ -103,23 +96,33 @@ struct CaptureContext* CaptureContextCreate(struct GpuContext* gpu_context) {
   };
 
   capture_context->drm_fd = OpenAnyModule();
-  if (capture_context->drm_fd == -1) return NULL;
+  if (capture_context->drm_fd == -1) {
+    LOG("Failed to open any module");
+    goto rollback_capture_context;
+  }
 
-  AUTO(drmModeResPtr) res = drmModeGetResources(capture_context->drm_fd);
+  drmModeResPtr res = drmModeGetResources(capture_context->drm_fd);
   if (!res) {
     LOG("Failed to get drm mode resources (%s)", strerror(errno));
-    return NULL;
+    goto rollback_drm_fd;
   }
 
   for (int i = 0; i < res->count_crtcs; i++) {
     if (IsCrtcComplete(capture_context->drm_fd, res->crtcs[i])) {
       LOG("Capturing crtc %u", res->crtcs[i]);
       capture_context->crtc_id = res->crtcs[i];
-      return RELEASE(capture_context);
+      drmModeFreeResources(res);
+      return capture_context;
     }
   }
 
   LOG("Nothing to capture");
+  drmModeFreeResources(res);
+
+rollback_drm_fd:
+  drmClose(capture_context->drm_fd);
+rollback_capture_context:
+  free(capture_context);
   return NULL;
 }
 
@@ -155,35 +158,38 @@ release_planes:
 
 const struct GpuFrame* CaptureContextGetFrame(
     struct CaptureContext* capture_context) {
-  AUTO(drmModeCrtcPtr)
-  crtc = drmModeGetCrtc(capture_context->drm_fd, capture_context->crtc_id);
+  drmModeCrtcPtr crtc =
+      drmModeGetCrtc(capture_context->drm_fd, capture_context->crtc_id);
   if (!crtc) {
     LOG("Failed to get crtc %u", capture_context->crtc_id);
     return NULL;
   }
 
-  AUTO(drmModeFB2Ptr)
-  fb2 = drmModeGetFB2(capture_context->drm_fd, crtc->buffer_id);
+  struct GpuFrame* gpu_frame = NULL;
+  drmModeFB2Ptr fb2 = drmModeGetFB2(capture_context->drm_fd, crtc->buffer_id);
   if (!fb2) {
     LOG("Failed to get framebuffer %u", crtc->buffer_id);
-    return NULL;
+    goto rollback_crtc;
   }
   if (!fb2->handles[0]) {
     LOG("Framebuffer %u has no handles", crtc->buffer_id);
-    return NULL;
+    goto rollback_fb2;
   }
 
-  GpuFrameDestroy(&capture_context->gpu_frame);
+  if (capture_context->gpu_frame) GpuFrameDestroy(capture_context->gpu_frame);
   capture_context->gpu_frame = WrapFramebuffer(capture_context->drm_fd, fb2,
                                                capture_context->gpu_context);
-  return capture_context->gpu_frame;
+  gpu_frame = capture_context->gpu_frame;
+
+rollback_fb2:
+  drmModeFreeFB2(fb2);
+rollback_crtc:
+  drmModeFreeCrtc(crtc);
+  return gpu_frame;
 }
 
-void CaptureContextDestroy(struct CaptureContext** capture_context) {
-  if (!capture_context || !*capture_context) return;
-  if ((*capture_context)->gpu_frame)
-    GpuFrameDestroy(&(*capture_context)->gpu_frame);
-  if ((*capture_context)->drm_fd != -1) drmClose((*capture_context)->drm_fd);
-  free(*capture_context);
-  capture_context = NULL;
+void CaptureContextDestroy(struct CaptureContext* capture_context) {
+  GpuFrameDestroy(capture_context->gpu_frame);
+  drmClose(capture_context->drm_fd);
+  free(capture_context);
 }

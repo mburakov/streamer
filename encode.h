@@ -37,6 +37,6 @@ const struct GpuFrame* EncodeContextGetFrame(
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
                               struct TimingStats* encode,
                               struct TimingStats* drain);
-void EncodeContextDestroy(struct EncodeContext** encode_context);
+void EncodeContextDestroy(struct EncodeContext* encode_context);
 
 #endif  // STREAMER_ENCODE_H_

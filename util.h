@@ -22,17 +22,9 @@
 #define STR(x) STR_IMPL(x)
 #define LOG(fmt, ...) \
   fprintf(stderr, __FILE__ ":" STR(__LINE__) " " fmt "\n", ##__VA_ARGS__)
-#define AUTO(x) x __attribute__((__cleanup__(x##Destroy)))
-#define RELEASE(x) Release((void**)&x)
 #define LENGTH(x) (sizeof(x) / sizeof *(x))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define _(...) __VA_ARGS__
-
-static inline void* Release(void** x) {
-  void* result = *x;
-  *x = 0;
-  return result;
-}
 
 #endif  // STREAMER_UTIL_H_

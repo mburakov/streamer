@@ -25,6 +25,6 @@ struct GpuFrame;
 struct CaptureContext* CaptureContextCreate(struct GpuContext* gpu_context);
 const struct GpuFrame* CaptureContextGetFrame(
     struct CaptureContext* capture_context);
-void CaptureContextDestroy(struct CaptureContext** capture_context);
+void CaptureContextDestroy(struct CaptureContext* capture_context);
 
 #endif  // STREAMER_CAPTURE_H_

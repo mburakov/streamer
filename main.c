@@ -39,6 +39,24 @@ static const enum YuvRange range = kNarrowRange;
 static volatile sig_atomic_t g_signal;
 static void OnSignal(int status) { g_signal = status; }
 
+static void GpuContextDtor(struct GpuContext** gpu_context) {
+  if (!*gpu_context) return;
+  GpuContextDestroy(*gpu_context);
+  *gpu_context = NULL;
+}
+
+static void CaptureContextDtor(struct CaptureContext** capture_context) {
+  if (!*capture_context) return;
+  CaptureContextDestroy(*capture_context);
+  *capture_context = NULL;
+}
+
+static void EncodeContextDtor(struct EncodeContext** encode_context) {
+  if (!*encode_context) return;
+  EncodeContextDestroy(*encode_context);
+  *encode_context = NULL;
+}
+
 int main(int argc, char* argv[]) {
   (void)argc;
   (void)argv;
@@ -50,20 +68,23 @@ int main(int argc, char* argv[]) {
     return EXIT_FAILURE;
   }
 
-  struct AUTO(GpuContext)* gpu_context = GpuContextCreate(colorspace, range);
+  struct GpuContext __attribute__((cleanup(GpuContextDtor)))* gpu_context =
+      GpuContextCreate(colorspace, range);
   if (!gpu_context) {
     LOG("Failed to create gpu context");
     return EXIT_FAILURE;
   }
 
-  struct AUTO(CaptureContext)* capture_context =
-      CaptureContextCreate(gpu_context);
+  struct CaptureContext
+      __attribute__((cleanup(CaptureContextDtor)))* capture_context =
+          CaptureContextCreate(gpu_context);
   if (!capture_context) {
     LOG("Failed to create capture context");
     return EXIT_FAILURE;
   }
 
-  struct AUTO(EncodeContext)* encode_context = NULL;
+  struct EncodeContext
+      __attribute__((cleanup(EncodeContextDtor)))* encode_context = NULL;
 
   struct TimingStats capture;
   struct TimingStats convert;

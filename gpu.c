@@ -42,7 +42,7 @@
   gpu_context->b = (a)eglGetProcAddress(#b);  \
   if (!gpu_context->b) {                      \
     LOG("Failed to look up " #b " function"); \
-    return NULL;                              \
+    goto rollback_display;                    \
   }
 
 // TODO(mburakov): It should be theoretically possible to do everything in a
@@ -269,7 +269,7 @@ static bool SetupCommonUniforms(GLuint program, enum YuvColorspace colorspace,
 
 struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
                                     enum YuvRange range) {
-  struct AUTO(GpuContext)* gpu_context = malloc(sizeof(struct GpuContext));
+  struct GpuContext* gpu_context = malloc(sizeof(struct GpuContext));
   if (!gpu_context) {
     LOG("Failed to allocate gpu context (%s)", strerror(errno));
     return NULL;
@@ -287,7 +287,7 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
   if (!egl_ext) {
     LOG("Failed to query platformless egl extensions (%s)",
         EglErrorString(eglGetError()));
-    return NULL;
+    goto rollback_gpu_context;
   }
 
   LOG("EGL_EXTENSIONS: %s", egl_ext);
@@ -297,40 +297,46 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
   // framebuffers are reported as supported by EGL. Maybe that's because the
   // support for RDNA3 is still quite young in MESA.
 #ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
-  if (!HasExtension(egl_ext, "EGL_MESA_platform_gbm")) return NULL;
+  if (!HasExtension(egl_ext, "EGL_MESA_platform_gbm"))
+    goto rollback_gpu_context;
   gpu_context->render_node = open("/dev/dri/renderD128", O_RDWR);
   if (gpu_context->render_node == -1) {
     LOG("Failed to open render node (%s)", strerror(errno));
-    return NULL;
+    goto rollback_gpu_context;
   }
   gpu_context->device = gbm_create_device(gpu_context->render_node);
   if (!gpu_context->device) {
     LOG("Failed to create gbm device (%s)", strerror(errno));
-    return NULL;
+    goto rollback_render_node;
   }
   gpu_context->display =
       eglGetPlatformDisplay(EGL_PLATFORM_GBM_MESA, gpu_context->device, NULL);
 #else   // USE_EGL_MESA_PLATFORM_SURFACELESS
-  if (!HasExtension(egl_ext, "EGL_MESA_platform_surfaceless")) return NULL;
+  if (!HasExtension(egl_ext, "EGL_MESA_platform_surfaceless"))
+    goto rollback_gpu_context;
   gpu_context->display =
       eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, NULL, NULL);
 #endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
   if (gpu_context->display == EGL_NO_DISPLAY) {
     LOG("Failed to get egl display (%s)", EglErrorString(eglGetError()));
-    return NULL;
+#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
+    goto rollback_device;
+#else   // USE_EGL_MESA_PLATFORM_SURFACELESS
+    goto rollback_gpu_context;
+#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
   }
 
   EGLint major, minor;
   if (!eglInitialize(gpu_context->display, &major, &minor)) {
     LOG("Failed to initialize egl display (%s)", EglErrorString(eglGetError()));
-    return NULL;
+    goto rollback_display;
   }
 
   LOG("Initialized EGL %d.%d", major, minor);
   egl_ext = eglQueryString(gpu_context->display, EGL_EXTENSIONS);
   if (!egl_ext) {
     LOG("Failed to query egl extensions (%s)", EglErrorString(eglGetError()));
-    return NULL;
+    goto rollback_display;
   }
 
   LOG("EGL_EXTENSIONS: %s", egl_ext);
@@ -338,13 +344,13 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
       !HasExtension(egl_ext, "EGL_KHR_no_config_context") ||
       !HasExtension(egl_ext, "EGL_EXT_image_dma_buf_import") ||
       !HasExtension(egl_ext, "EGL_EXT_image_dma_buf_import_modifiers"))
-    return NULL;
+    goto rollback_display;
   LOOKUP_FUNCTION(PFNEGLQUERYDMABUFFORMATSEXTPROC, eglQueryDmaBufFormatsEXT)
   LOOKUP_FUNCTION(PFNEGLQUERYDMABUFMODIFIERSEXTPROC, eglQueryDmaBufModifiersEXT)
 
   if (!eglBindAPI(EGL_OPENGL_ES_API)) {
     LOG("Failed to bind egl api (%s)", EglErrorString(eglGetError()));
-    return NULL;
+    goto rollback_display;
   }
 
   static const EGLint context_attribs[] = {
@@ -356,24 +362,24 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
       gpu_context->display, EGL_NO_CONFIG_KHR, EGL_NO_CONTEXT, context_attribs);
   if (gpu_context->context == EGL_NO_CONTEXT) {
     LOG("Failed to create egl context (%s)", EglErrorString(eglGetError()));
-    return NULL;
+    goto rollback_display;
   }
 
   if (!eglMakeCurrent(gpu_context->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                       gpu_context->context)) {
     LOG("Failed to make egl context current (%s)",
         EglErrorString(eglGetError()));
-    return NULL;
+    goto rollback_context;
   }
 
   const char* gl_ext = (const char*)glGetString(GL_EXTENSIONS);
   if (!gl_ext) {
     LOG("Failed to get gl extensions (%s)", GlErrorString(glGetError()));
-    return NULL;
+    goto rollback_context;
   }
 
   LOG("GL_EXTENSIONS: %s", gl_ext);
-  if (!HasExtension(gl_ext, "GL_OES_EGL_image")) return NULL;
+  if (!HasExtension(gl_ext, "GL_OES_EGL_image")) goto rollback_context;
   LOOKUP_FUNCTION(PFNGLEGLIMAGETARGETTEXTURE2DOESPROC,
                   glEGLImageTargetTexture2DOES)
 
@@ -383,7 +389,7 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
   if (!gpu_context->program_luma ||
       !SetupCommonUniforms(gpu_context->program_luma, colorspace, range)) {
     LOG("Failed to create luma program");
-    return NULL;
+    goto rollback_context;
   }
 
   gpu_context->program_chroma =
@@ -392,14 +398,14 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
   if (!gpu_context->program_chroma ||
       !SetupCommonUniforms(gpu_context->program_chroma, colorspace, range)) {
     LOG("Failed to create chroma program");
-    return NULL;
+    goto rollback_program_luma;
   }
   gpu_context->sample_offsets =
       glGetUniformLocation(gpu_context->program_chroma, "sample_offsets");
   if (gpu_context->sample_offsets == -1) {
     LOG("Failed to find sample_offsets uniform (%s)",
         GlErrorString(glGetError()));
-    return NULL;
+    goto rollback_program_chroma;
   }
 
   glGenFramebuffers(1, &gpu_context->framebuffer);
@@ -413,9 +419,33 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
   GLenum error = glGetError();
   if (error != GL_NO_ERROR) {
     LOG("Failed to create gl objects (%s)", GlErrorString(glGetError()));
-    return NULL;
+    goto rollback_buffers;
   }
-  return RELEASE(gpu_context);
+  return gpu_context;
+
+rollback_buffers:
+  if (gpu_context->vertices) glDeleteBuffers(1, &gpu_context->vertices);
+  if (gpu_context->framebuffer)
+    glDeleteFramebuffers(1, &gpu_context->framebuffer);
+rollback_program_chroma:
+  glDeleteProgram(gpu_context->program_chroma);
+rollback_program_luma:
+  glDeleteProgram(gpu_context->program_luma);
+rollback_context:
+  eglMakeCurrent(gpu_context->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                 EGL_NO_CONTEXT);
+  eglDestroyContext(gpu_context->display, gpu_context->context);
+rollback_display:
+  eglTerminate(gpu_context->display);
+#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
+rollback_device:
+  gbm_device_destroy(gpu_context->device);
+rollback_render_node:
+  close(gpu_context->render_node);
+#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
+rollback_gpu_context:
+  free(gpu_context);
+  return NULL;
 }
 
 bool GpuContextSync(struct GpuContext* gpu_context) {
@@ -429,28 +459,20 @@ bool GpuContextSync(struct GpuContext* gpu_context) {
   return true;
 }
 
-void GpuContextDestroy(struct GpuContext** gpu_context) {
-  if (!gpu_context || !*gpu_context) return;
-  if ((*gpu_context)->vertices) glDeleteBuffers(1, &(*gpu_context)->vertices);
-  if ((*gpu_context)->framebuffer)
-    glDeleteFramebuffers(1, &(*gpu_context)->framebuffer);
-  if ((*gpu_context)->program_chroma)
-    glDeleteProgram((*gpu_context)->program_chroma);
-  if ((*gpu_context)->program_luma)
-    glDeleteProgram((*gpu_context)->program_luma);
-  if ((*gpu_context)->context != EGL_NO_CONTEXT) {
-    eglMakeCurrent((*gpu_context)->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   EGL_NO_CONTEXT);
-    eglDestroyContext((*gpu_context)->display, (*gpu_context)->context);
-  }
-  if ((*gpu_context)->display != EGL_NO_DISPLAY)
-    eglTerminate((*gpu_context)->display);
+void GpuContextDestroy(struct GpuContext* gpu_context) {
+  glDeleteBuffers(1, &gpu_context->vertices);
+  glDeleteFramebuffers(1, &gpu_context->framebuffer);
+  glDeleteProgram(gpu_context->program_chroma);
+  glDeleteProgram(gpu_context->program_luma);
+  eglMakeCurrent(gpu_context->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                 EGL_NO_CONTEXT);
+  eglDestroyContext(gpu_context->display, gpu_context->context);
+  eglTerminate(gpu_context->display);
 #ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
-  if ((*gpu_context)->device) gbm_device_destroy((*gpu_context)->device);
-  if ((*gpu_context)->render_node != -1) close((*gpu_context)->render_node);
+  gbm_device_destroy(gpu_context->device);
+  close(gpu_context->render_node);
 #endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
-  free(*gpu_context);
-  *gpu_context = NULL;
+  free(gpu_context);
 }
 
 static void DumpEglImageParams(const EGLAttrib* attribs) {
@@ -646,7 +668,7 @@ struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
                                 uint32_t height, uint32_t fourcc,
                                 size_t nplanes,
                                 const struct GpuFramePlane* planes) {
-  struct AUTO(GpuFrame)* gpu_frame = malloc(sizeof(struct GpuFrame));
+  struct GpuFrame* gpu_frame = malloc(sizeof(struct GpuFrame));
   if (!gpu_frame) {
     LOG("Failed to allocate gpu frame (%s)", strerror(errno));
     return NULL;
@@ -657,18 +679,17 @@ struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
       .height = height,
       .dmabuf_fds = {-1, -1, -1, -1},
       .images = {EGL_NO_IMAGE, EGL_NO_IMAGE},
-      .textures = {0, 0},
   };
 
   for (size_t i = 0; i < nplanes; i++) {
     gpu_frame->dmabuf_fds[i] = dup(planes[i].dmabuf_fd);
     if (gpu_frame->dmabuf_fds[i] == -1) {
       LOG("Failed to dup dmabuf fd (%s)", strerror(errno));
-      return NULL;
+      goto rollback_dmabuf_fds;
     }
   }
 
-  struct GpuFramePlane dummy_planes[nplanes];
+  struct GpuFramePlane dummy_planes[4];
   for (size_t i = 0; i < nplanes; i++) {
     dummy_planes[i] = (struct GpuFramePlane){
         .dmabuf_fd = gpu_frame->dmabuf_fds[i],
@@ -683,20 +704,20 @@ struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
                                           DRM_FORMAT_R8, 1, &dummy_planes[0]);
     if (gpu_frame->images[0] == EGL_NO_IMAGE) {
       LOG("Failed to create luma plane image");
-      return NULL;
+      goto rollback_dmabuf_fds;
     }
     gpu_frame->images[1] = CreateEglImage(gpu_context, width / 2, height / 2,
                                           DRM_FORMAT_GR88, 1, &dummy_planes[1]);
     if (gpu_frame->images[1] == EGL_NO_IMAGE) {
       LOG("Failed to create chroma plane image");
-      return NULL;
+      goto rollback_images;
     }
   } else {
     gpu_frame->images[0] = CreateEglImage(gpu_context, width, height, fourcc,
                                           nplanes, dummy_planes);
     if (gpu_frame->images[0] == EGL_NO_IMAGE) {
       LOG("Failed to create multiplanar image");
-      return NULL;
+      goto rollback_dmabuf_fds;
     }
   }
 
@@ -705,11 +726,27 @@ struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
     gpu_frame->textures[i] = CreateTexture(gpu_context, gpu_frame->images[i]);
     if (!gpu_frame->textures[i]) {
       LOG("Failed to create texture");
-      return NULL;
+      goto rollback_textures;
     }
   }
+  return gpu_frame;
 
-  return RELEASE(gpu_frame);
+rollback_textures:
+  for (size_t i = LENGTH(gpu_frame->textures); i; i--) {
+    if (gpu_frame->textures[i - 1])
+      glDeleteTextures(1, &gpu_frame->textures[i - 1]);
+  }
+rollback_images:
+  for (size_t i = LENGTH(gpu_frame->images); i; i--) {
+    if (gpu_frame->images[i - 1] != EGL_NO_IMAGE)
+      eglDestroyImage(gpu_frame->gpu_context->device, gpu_frame->images[i - 1]);
+  }
+rollback_dmabuf_fds:
+  for (size_t i = LENGTH(gpu_frame->dmabuf_fds); i; i--) {
+    if (gpu_frame->dmabuf_fds[i - 1] != -1) close(gpu_frame->dmabuf_fds[i - 1]);
+  }
+  free(gpu_frame);
+  return NULL;
 }
 
 void GpuFrameGetSize(const struct GpuFrame* gpu_frame, uint32_t* width,
@@ -762,21 +799,17 @@ bool GpuFrameConvert(const struct GpuFrame* from, const struct GpuFrame* to) {
   return true;
 }
 
-void GpuFrameDestroy(struct GpuFrame** gpu_frame) {
-  if (!gpu_frame || !*gpu_frame) return;
-  for (size_t i = LENGTH((*gpu_frame)->textures); i; i--) {
-    if ((*gpu_frame)->textures[i - 1])
-      glDeleteTextures(1, &(*gpu_frame)->textures[i - 1]);
+void GpuFrameDestroy(struct GpuFrame* gpu_frame) {
+  for (size_t i = LENGTH(gpu_frame->textures); i; i--) {
+    if (gpu_frame->textures[i - 1])
+      glDeleteTextures(1, &gpu_frame->textures[i - 1]);
   }
-  for (size_t i = LENGTH((*gpu_frame)->images); i; i--) {
-    if ((*gpu_frame)->images[i - 1] != EGL_NO_IMAGE)
-      eglDestroyImage((*gpu_frame)->gpu_context->display,
-                      (*gpu_frame)->images[i - 1]);
+  for (size_t i = LENGTH(gpu_frame->images); i; i--) {
+    if (gpu_frame->images[i - 1] != EGL_NO_IMAGE)
+      eglDestroyImage(gpu_frame->gpu_context->device, gpu_frame->images[i - 1]);
   }
-  for (size_t i = LENGTH((*gpu_frame)->dmabuf_fds); i; i--) {
-    if ((*gpu_frame)->dmabuf_fds[i - 1] != -1)
-      close((*gpu_frame)->dmabuf_fds[i - 1]);
+  for (size_t i = LENGTH(gpu_frame->dmabuf_fds); i; i--) {
+    if (gpu_frame->dmabuf_fds[i - 1] != -1) close(gpu_frame->dmabuf_fds[i - 1]);
   }
-  free(*gpu_frame);
-  *gpu_frame = NULL;
+  free(gpu_frame);
 }

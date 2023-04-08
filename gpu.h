@@ -34,7 +34,7 @@ struct GpuFramePlane {
 struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
                                     enum YuvRange range);
 bool GpuContextSync(struct GpuContext* gpu_context);
-void GpuContextDestroy(struct GpuContext** gpu_context);
+void GpuContextDestroy(struct GpuContext* gpu_context);
 
 struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
                                 uint32_t height, uint32_t fourcc,
@@ -43,6 +43,6 @@ struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
 void GpuFrameGetSize(const struct GpuFrame* gpu_frame, uint32_t* width,
                      uint32_t* height);
 bool GpuFrameConvert(const struct GpuFrame* from, const struct GpuFrame* to);
-void GpuFrameDestroy(struct GpuFrame** gpu_frame);
+void GpuFrameDestroy(struct GpuFrame* gpu_frame);
 
 #endif  // STREAMER_GPU_H_

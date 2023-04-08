@@ -34,10 +34,6 @@
 #include "perf.h"
 #include "util.h"
 
-#define AVBufferRefDestroy av_buffer_unref
-#define AVFrameDestroy av_frame_free
-#define AVPacketDestroy av_packet_free
-
 struct EncodeContext {
   struct GpuContext* gpu_context;
   AVBufferRef* hwdevice_context;
@@ -49,32 +45,26 @@ struct EncodeContext {
 
 static bool SetHwFramesContext(struct EncodeContext* encode_context, int width,
                                int height) {
-  AUTO(AVBufferRef)* hwframes_context =
+  encode_context->codec_context->hw_frames_ctx =
       av_hwframe_ctx_alloc(encode_context->hwdevice_context);
-  if (!hwframes_context) {
+  if (!encode_context->codec_context->hw_frames_ctx) {
     LOG("Failed to allocate hwframes context");
     return false;
   }
 
-  AVHWFramesContext* hwframes_context_data = (void*)(hwframes_context->data);
+  AVHWFramesContext* hwframes_context_data =
+      (void*)(encode_context->codec_context->hw_frames_ctx->data);
   hwframes_context_data->initial_pool_size = 8;
   hwframes_context_data->format = AV_PIX_FMT_VAAPI;
   hwframes_context_data->sw_format = AV_PIX_FMT_NV12;
   hwframes_context_data->width = width;
   hwframes_context_data->height = height;
-  int err = av_hwframe_ctx_init(hwframes_context);
+  int err = av_hwframe_ctx_init(encode_context->codec_context->hw_frames_ctx);
   if (err < 0) {
     LOG("Failed to init hwframes context (%s)", av_err2str(err));
+    av_buffer_unref(&encode_context->codec_context->hw_frames_ctx);
     return false;
   }
-
-  encode_context->codec_context->hw_frames_ctx =
-      av_buffer_ref(hwframes_context);
-  if (!encode_context->codec_context->hw_frames_ctx) {
-    LOG("Failed to ref hwframes context");
-    return false;
-  }
-
   return true;
 }
 
@@ -105,38 +95,32 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
                                           uint32_t width, uint32_t height,
                                           enum YuvColorspace colrospace,
                                           enum YuvRange range) {
-  struct AUTO(EncodeContext)* encode_context =
-      malloc(sizeof(struct EncodeContext));
+  struct EncodeContext* encode_context = malloc(sizeof(struct EncodeContext));
   if (!encode_context) {
     LOG("Failed to allocate encode context (%s)", strerror(errno));
     return NULL;
   }
   *encode_context = (struct EncodeContext){
       .gpu_context = gpu_context,
-      .hwdevice_context = NULL,
-      .codec_context = NULL,
-      .hw_frame = NULL,
-      .gpu_frame = NULL,
   };
 
   int err = av_hwdevice_ctx_create(&encode_context->hwdevice_context,
                                    AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0);
   if (err < 0) {
     LOG("Failed to create hwdevice context (%s)", av_err2str(err));
-    return NULL;
+    goto rollback_encode_context;
   }
 
   static const char codec_name[] = "hevc_vaapi";
   const AVCodec* codec = avcodec_find_encoder_by_name(codec_name);
   if (!codec) {
     LOG("Failed to find %s encoder", codec_name);
-    return NULL;
+    goto rollback_hwdevice_context;
   }
-
   encode_context->codec_context = avcodec_alloc_context3(codec);
   if (!encode_context->codec_context) {
     LOG("Failed to allocate codec context");
-    return NULL;
+    goto rollback_hwdevice_context;
   }
 
   encode_context->codec_context->time_base = (AVRational){1, 60};
@@ -145,26 +129,53 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
   encode_context->codec_context->pix_fmt = AV_PIX_FMT_VAAPI;
   encode_context->codec_context->max_b_frames = 0;
   encode_context->codec_context->refs = 1;
-  encode_context->codec_context->global_quality = 32;
+  encode_context->codec_context->global_quality = 28;
   encode_context->codec_context->colorspace = ConvertColorspace(colrospace);
   encode_context->codec_context->color_range = ConvertRange(range);
 
   if (!SetHwFramesContext(encode_context, (int)width, (int)height)) {
     LOG("Failed to set hwframes context");
-    return NULL;
+    goto rollback_codec_context;
   }
-
   err = avcodec_open2(encode_context->codec_context, codec, NULL);
   if (err < 0) {
     LOG("Failed to open codec (%s)", av_err2str(err));
-    return NULL;
+    goto rollback_codec_context;
   }
-  return RELEASE(encode_context);
+  return encode_context;
+
+rollback_codec_context:
+  avcodec_free_context(&encode_context->codec_context);
+rollback_hwdevice_context:
+  av_buffer_unref(&encode_context->hwdevice_context);
+rollback_encode_context:
+  free(encode_context);
+  return NULL;
+}
+
+static struct GpuFrame* PrimeToGpuFrame(
+    struct GpuContext* gpu_context, const VADRMPRIMESurfaceDescriptor* prime) {
+  struct GpuFramePlane planes[4];
+  for (size_t i = 0; i < prime->layers[0].num_planes; i++) {
+    uint32_t object_index = prime->layers[0].object_index[i];
+    if (prime->objects[object_index].fd == -1) break;
+    planes[i] = (struct GpuFramePlane){
+        .dmabuf_fd = prime->objects[object_index].fd,
+        .pitch = prime->layers[0].pitch[i],
+        .offset = prime->layers[0].offset[i],
+        .modifier = prime->objects[object_index].drm_format_modifier,
+    };
+  }
+  struct GpuFrame* gpu_frame =
+      GpuFrameCreate(gpu_context, prime->width, prime->height, prime->fourcc,
+                     prime->layers[0].num_planes, planes);
+  for (size_t i = prime->num_objects; i; i--) close(prime->objects[i - 1].fd);
+  return gpu_frame;
 }
 
 const struct GpuFrame* EncodeContextGetFrame(
     struct EncodeContext* encode_context) {
-  AUTO(AVFrame)* hw_frame = av_frame_alloc();
+  AVFrame* hw_frame = av_frame_alloc();
   if (!hw_frame) {
     LOG("Failed to allocate hwframe");
     return NULL;
@@ -174,11 +185,11 @@ const struct GpuFrame* EncodeContextGetFrame(
                                   hw_frame, 0);
   if (err < 0) {
     LOG("Failed to get hwframe buffer (%s)", av_err2str(err));
-    return NULL;
+    goto rollback_hw_frame;
   }
   if (!hw_frame->hw_frames_ctx) {
     LOG("Failed to ref hwframe context");
-    return NULL;
+    goto rollback_hw_frame;
   }
 
   // mburakov: Roughly based on Sunshine code...
@@ -193,33 +204,23 @@ const struct GpuFrame* EncodeContextGetFrame(
       VA_EXPORT_SURFACE_WRITE_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &prime);
   if (status != VA_STATUS_SUCCESS) {
     LOG("Failed to export vaapi surface (%d)", status);
-    return NULL;
+    goto rollback_hw_frame;
   }
 
-  struct GpuFramePlane planes[prime.layers[0].num_planes];
-  for (size_t i = 0; i < LENGTH(planes); i++) {
-    planes[i] = (struct GpuFramePlane){
-        .dmabuf_fd = prime.objects[prime.layers[0].object_index[i]].fd,
-        .pitch = prime.layers[0].pitch[i],
-        .offset = prime.layers[0].offset[i],
-        .modifier =
-            prime.objects[prime.layers[0].object_index[i]].drm_format_modifier,
-    };
-  }
-  struct AUTO(GpuFrame)* gpu_frame =
-      GpuFrameCreate(encode_context->gpu_context, prime.width, prime.height,
-                     prime.fourcc, LENGTH(planes), planes);
+  struct GpuFrame* gpu_frame =
+      PrimeToGpuFrame(encode_context->gpu_context, &prime);
   if (!gpu_frame) {
     LOG("Failed to create gpu frame");
-    goto release_planes;
+    goto rollback_hw_frame;
   }
 
-  encode_context->hw_frame = RELEASE(hw_frame);
-  encode_context->gpu_frame = RELEASE(gpu_frame);
+  encode_context->hw_frame = hw_frame;
+  encode_context->gpu_frame = gpu_frame;
+  return gpu_frame;
 
-release_planes:
-  for (size_t i = prime.num_objects; i; i--) close(prime.objects[i - 1].fd);
-  return encode_context->gpu_frame;
+rollback_hw_frame:
+  av_frame_free(&hw_frame);
+  return NULL;
 }
 
 static bool DrainPacket(const struct AVPacket* packet, int fd) {
@@ -255,19 +256,23 @@ static bool DrainPacket(const struct AVPacket* packet, int fd) {
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
                               struct TimingStats* encode,
                               struct TimingStats* drain) {
+  bool result = false;
   unsigned long long before_send = MicrosNow();
-  GpuFrameDestroy(&encode_context->gpu_frame);
-  AUTO(AVFrame)* hw_frame = RELEASE(encode_context->hw_frame);
-  AUTO(AVPacket)* packet = av_packet_alloc();
+  if (encode_context->gpu_frame) {
+    GpuFrameDestroy(encode_context->gpu_frame);
+    encode_context->gpu_frame = NULL;
+  }
+  AVPacket* packet = av_packet_alloc();
   if (!packet) {
     LOG("Failed to allocate packet (%s)", strerror(errno));
-    return false;
+    goto rollback_hw_frame;
   }
 
-  int err = avcodec_send_frame(encode_context->codec_context, hw_frame);
+  int err = avcodec_send_frame(encode_context->codec_context,
+                               encode_context->hw_frame);
   if (err < 0) {
     LOG("Failed to send frame (%s)", av_err2str(err));
-    return false;
+    goto rollback_packet;
   }
 
   unsigned long long total_send = MicrosNow() - before_send;
@@ -284,10 +289,11 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
         total_receive += MicrosNow() - before_receive;
         if (encode) TimingStatsRecord(encode, total_send + total_receive);
         if (drain) TimingStatsRecord(drain, total_drain);
-        return true;
+        result = true;
+        goto rollback_packet;
       default:
         LOG("Failed to receive packet (%s)", av_err2str(err));
-        return false;
+        goto rollback_packet;
     }
 
     packet->stream_index = 0;
@@ -296,21 +302,24 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
     av_packet_unref(packet);
     if (!result) {
       LOG("Failed to write full packet (%s)", strerror(errno));
-      return false;
+      goto rollback_packet;
     }
 
     total_receive += before_drain - before_receive;
     total_drain += MicrosNow() - before_drain;
   }
+
+rollback_packet:
+  av_packet_free(&packet);
+rollback_hw_frame:
+  av_frame_free(&encode_context->hw_frame);
+  return result;
 }
 
-void EncodeContextDestroy(struct EncodeContext** encode_context) {
-  if (!encode_context || !*encode_context) return;
-  if ((*encode_context)->gpu_frame)
-    GpuFrameDestroy(&(*encode_context)->gpu_frame);
-  if ((*encode_context)->hw_frame) av_frame_free(&(*encode_context)->hw_frame);
-  if ((*encode_context)->codec_context)
-    avcodec_free_context(&(*encode_context)->codec_context);
-  if ((*encode_context)->hwdevice_context)
-    av_buffer_unref(&(*encode_context)->hwdevice_context);
+void EncodeContextDestroy(struct EncodeContext* encode_context) {
+  if (encode_context->gpu_frame) GpuFrameDestroy(encode_context->gpu_frame);
+  if (encode_context->hw_frame) av_frame_free(&encode_context->hw_frame);
+  avcodec_free_context(&encode_context->codec_context);
+  av_buffer_unref(&encode_context->hwdevice_context);
+  free(encode_context);
 }
