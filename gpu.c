@@ -36,8 +36,9 @@
 #include <gbm.h>
 #endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
 
-#include "util.h"
+#include "toolbox/utils.h"
 
+#define _(...) __VA_ARGS__
 #define LOOKUP_FUNCTION(a, b)                 \
   gpu_context->b = (a)eglGetProcAddress(#b);  \
   if (!gpu_context->b) {                      \

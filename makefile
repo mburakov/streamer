@@ -2,6 +2,9 @@ bin:=$(notdir $(shell pwd))
 src:=$(shell ls *.c)
 obj:=$(src:.c=.o)
 
+obj+=\
+	toolbox/perf.o
+
 libs:=\
 	egl \
 	gbm \

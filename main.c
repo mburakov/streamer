@@ -26,8 +26,8 @@
 #include "colorspace.h"
 #include "encode.h"
 #include "gpu.h"
-#include "perf.h"
-#include "util.h"
+#include "toolbox/perf.h"
+#include "toolbox/utils.h"
 
 // TODO(mburakov): Currently zwp_linux_dmabuf_v1 has no way to provide
 // colorspace and range information to the compositor. Maybe this would change
@@ -55,6 +55,12 @@ static void EncodeContextDtor(struct EncodeContext** encode_context) {
   if (!*encode_context) return;
   EncodeContextDestroy(*encode_context);
   *encode_context = NULL;
+}
+
+static void TimingStatsLog(const struct TimingStats* timing_stats,
+                           const char* name) {
+  LOG("%s min/avg/max: %llu/%llu/%llu", name, timing_stats->min,
+      timing_stats->sum / timing_stats->counter, timing_stats->max);
 }
 
 int main(int argc, char* argv[]) {
@@ -96,7 +102,6 @@ int main(int argc, char* argv[]) {
   TimingStatsReset(&encode);
   TimingStatsReset(&drain);
   TimingStatsReset(&total);
-  unsigned long long num_frames = 0;
 
   unsigned long long recording_started = MicrosNow();
   static const unsigned long long delta = 1000000ull / 60ull;
@@ -151,24 +156,22 @@ int main(int argc, char* argv[]) {
     static const unsigned long long second = 1000000;
     if (period > 10 * second) {
       LOG("---->8-------->8-------->8----");
-      TimingStatsLog(&capture, "Capture", num_frames);
-      TimingStatsLog(&convert, "Convert", num_frames);
-      TimingStatsLog(&encode, "Encode", num_frames);
-      TimingStatsLog(&drain, "Drain", num_frames);
-      TimingStatsLog(&total, "Total", num_frames);
+      TimingStatsLog(&capture, "Capture");
+      TimingStatsLog(&convert, "Convert");
+      TimingStatsLog(&encode, "Encode");
+      TimingStatsLog(&drain, "Drain");
+      TimingStatsLog(&total, "Total");
       TimingStatsReset(&capture);
       TimingStatsReset(&convert);
       TimingStatsReset(&encode);
       TimingStatsReset(&drain);
       TimingStatsReset(&total);
       recording_started = now;
-      num_frames = 0;
     }
 
     now = MicrosNow();
     unsigned long long micros = now < next ? next - now : 0;
     if (micros) usleep((unsigned)micros);
-    num_frames++;
   }
 
   if (!EncodeContextEncodeFrame(encode_context, STDOUT_FILENO, NULL, NULL)) {

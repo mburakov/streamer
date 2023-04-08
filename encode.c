@@ -31,8 +31,8 @@
 #include <va/va_drmcommon.h>
 
 #include "gpu.h"
-#include "perf.h"
-#include "util.h"
+#include "toolbox/perf.h"
+#include "toolbox/utils.h"
 
 struct EncodeContext {
   struct GpuContext* gpu_context;

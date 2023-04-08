@@ -27,7 +27,7 @@
 #include <xf86drmMode.h>
 
 #include "gpu.h"
-#include "util.h"
+#include "toolbox/utils.h"
 
 struct CaptureContext {
   struct GpuContext* gpu_context;
