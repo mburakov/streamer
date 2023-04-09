@@ -108,10 +108,6 @@ static void MaybeDropClient(struct Contexts* contexts) {
     close(contexts->client_fd);
     contexts->client_fd = -1;
   }
-  if (timerfd_settime(contexts->timer_fd, 0, &spec, NULL)) {
-    LOG("Failed to disarm timer (%s)", strerror(errno));
-    g_signal = SIGABRT;
-  }
 }
 
 static void OnTimerExpire(void* user) {
@@ -130,8 +126,12 @@ static void OnTimerExpire(void* user) {
     return;
   }
   if (contexts->client_fd == -1) {
-    // TODO(mburakov): Is this actually possible?
-    LOG("Timer expired with disconnected client");
+    // mburakov: Timer must disarm itself AFTER reading.
+    static const struct itimerspec spec = {0};
+    if (timerfd_settime(contexts->timer_fd, 0, &spec, NULL)) {
+      LOG("Failed to disarm timer (%s)", strerror(errno));
+      g_signal = SIGABRT;
+    }
     return;
   }
 
