@@ -26,7 +26,6 @@
 struct EncodeContext;
 struct GpuContext;
 struct GpuFrame;
-struct TimingStats;
 
 struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
                                           uint32_t width, uint32_t height,
@@ -34,9 +33,7 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
                                           enum YuvRange range);
 const struct GpuFrame* EncodeContextGetFrame(
     struct EncodeContext* encode_context);
-bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
-                              struct TimingStats* encode,
-                              struct TimingStats* drain);
+bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd);
 void EncodeContextDestroy(struct EncodeContext* encode_context);
 
 #endif  // STREAMER_ENCODE_H_

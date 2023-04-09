@@ -189,7 +189,7 @@ rollback_crtc:
 }
 
 void CaptureContextDestroy(struct CaptureContext* capture_context) {
-  GpuFrameDestroy(capture_context->gpu_frame);
+  if (capture_context->gpu_frame) GpuFrameDestroy(capture_context->gpu_frame);
   drmClose(capture_context->drm_fd);
   free(capture_context);
 }

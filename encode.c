@@ -31,7 +31,6 @@
 #include <va/va_drmcommon.h>
 
 #include "gpu.h"
-#include "toolbox/perf.h"
 #include "toolbox/utils.h"
 
 struct EncodeContext {
@@ -231,17 +230,10 @@ static bool DrainPacket(const struct AVPacket* packet, int fd) {
   };
   for (;;) {
     ssize_t result = writev(fd, iov, LENGTH(iov));
-    switch (result) {
-      case -1:
-        if (errno == EINTR) continue;
-        if (errno == EPIPE) return true;
-        LOG("Failed to write packed (%s)", strerror(errno));
-        return false;
-      case 0:
-        LOG("Output file descriptor closed");
-        return false;
-      default:
-        break;
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      LOG("Failed to write (%s)", strerror(errno));
+      return false;
     }
     for (size_t i = 0; i < LENGTH(iov); i++) {
       size_t delta = MIN((size_t)result, iov[i].iov_len);
@@ -253,11 +245,8 @@ static bool DrainPacket(const struct AVPacket* packet, int fd) {
   }
 }
 
-bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
-                              struct TimingStats* encode,
-                              struct TimingStats* drain) {
+bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
   bool result = false;
-  unsigned long long before_send = MicrosNow();
   if (encode_context->gpu_frame) {
     GpuFrameDestroy(encode_context->gpu_frame);
     encode_context->gpu_frame = NULL;
@@ -275,20 +264,13 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
     goto rollback_packet;
   }
 
-  unsigned long long total_send = MicrosNow() - before_send;
-  unsigned long long total_receive = 0;
-  unsigned long long total_drain = 0;
   for (;;) {
-    unsigned long long before_receive = MicrosNow();
     err = avcodec_receive_packet(encode_context->codec_context, packet);
     switch (err) {
       case 0:
         break;
       case AVERROR(EAGAIN):
       case AVERROR_EOF:
-        total_receive += MicrosNow() - before_receive;
-        if (encode) TimingStatsRecord(encode, total_send + total_receive);
-        if (drain) TimingStatsRecord(drain, total_drain);
         result = true;
         goto rollback_packet;
       default:
@@ -297,16 +279,12 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
     }
 
     packet->stream_index = 0;
-    unsigned long long before_drain = MicrosNow();
     bool result = DrainPacket(packet, fd);
     av_packet_unref(packet);
     if (!result) {
-      LOG("Failed to write full packet (%s)", strerror(errno));
+      LOG("Failed to drain packet");
       goto rollback_packet;
     }
-
-    total_receive += before_drain - before_receive;
-    total_drain += MicrosNow() - before_drain;
   }
 
 rollback_packet:
