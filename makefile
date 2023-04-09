@@ -1,8 +1,9 @@
 bin:=$(notdir $(shell pwd))
-src:=$(shell ls *.c)
+src:=$(wildcard *.c)
 obj:=$(src:.c=.o)
 
 obj+=\
+	toolbox/buffer.o \
 	toolbox/io_muxer.o
 
 libs:=\
