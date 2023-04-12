@@ -264,27 +264,25 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     goto rollback_packet;
   }
 
-  for (;;) {
-    err = avcodec_receive_packet(encode_context->codec_context, packet);
-    switch (err) {
-      case 0:
-        break;
-      case AVERROR(EAGAIN):
-      case AVERROR_EOF:
-        result = true;
-        goto rollback_packet;
-      default:
-        LOG("Failed to receive packet (%s)", av_err2str(err));
-        goto rollback_packet;
-    }
-
-    packet->stream_index = 0;
-    bool result = DrainPacket(packet, fd);
-    av_packet_unref(packet);
-    if (!result) {
-      LOG("Failed to drain packet");
+  err = avcodec_receive_packet(encode_context->codec_context, packet);
+  switch (err) {
+    case 0:
+      break;
+    case AVERROR(EAGAIN):
+      // TODO(mburakov): This happens only for the very first frame, and
+      // effectively introduces an additional latency of 16ms...
+      result = true;
       goto rollback_packet;
-    }
+    default:
+      LOG("Failed to receive packet (%s)", av_err2str(err));
+      goto rollback_packet;
+  }
+
+  result = DrainPacket(packet, fd);
+  av_packet_unref(packet);
+  if (!result) {
+    LOG("Failed to drain packet");
+    goto rollback_packet;
   }
 
 rollback_packet:
