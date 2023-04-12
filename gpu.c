@@ -651,44 +651,25 @@ struct GpuFrame* GpuContextCreateFrame(struct GpuContext* gpu_context,
       .images = {EGL_NO_IMAGE, EGL_NO_IMAGE},
   };
 
-  for (size_t i = 0; i < nplanes; i++) {
-    gpu_frame_impl->dmabuf_fds[i] = dup(planes[i].dmabuf_fd);
-    if (gpu_frame_impl->dmabuf_fds[i] == -1) {
-      LOG("Failed to dup dmabuf fd (%s)", strerror(errno));
-      goto rollback_dmabuf_fds;
-    }
-  }
-
-  struct GpuFramePlane dummy_planes[4];
-  for (size_t i = 0; i < nplanes; i++) {
-    dummy_planes[i] = (struct GpuFramePlane){
-        .dmabuf_fd = gpu_frame_impl->dmabuf_fds[i],
-        .offset = planes[i].offset,
-        .pitch = planes[i].pitch,
-        .modifier = planes[i].modifier,
-    };
-  }
-
   if (fourcc == DRM_FORMAT_NV12) {
-    gpu_frame_impl->images[0] = CreateEglImage(
-        gpu_context, width, height, DRM_FORMAT_R8, 1, &dummy_planes[0]);
+    gpu_frame_impl->images[0] = CreateEglImage(gpu_context, width, height,
+                                               DRM_FORMAT_R8, 1, &planes[0]);
     if (gpu_frame_impl->images[0] == EGL_NO_IMAGE) {
       LOG("Failed to create luma plane image");
-      goto rollback_dmabuf_fds;
+      goto rollback_gpu_frame;
     }
-    gpu_frame_impl->images[1] =
-        CreateEglImage(gpu_context, width / 2, height / 2, DRM_FORMAT_GR88, 1,
-                       &dummy_planes[1]);
+    gpu_frame_impl->images[1] = CreateEglImage(
+        gpu_context, width / 2, height / 2, DRM_FORMAT_GR88, 1, &planes[1]);
     if (gpu_frame_impl->images[1] == EGL_NO_IMAGE) {
       LOG("Failed to create chroma plane image");
       goto rollback_images;
     }
   } else {
-    gpu_frame_impl->images[0] = CreateEglImage(gpu_context, width, height,
-                                               fourcc, nplanes, dummy_planes);
+    gpu_frame_impl->images[0] =
+        CreateEglImage(gpu_context, width, height, fourcc, nplanes, planes);
     if (gpu_frame_impl->images[0] == EGL_NO_IMAGE) {
       LOG("Failed to create multiplanar image");
-      goto rollback_dmabuf_fds;
+      goto rollback_gpu_frame;
     }
   }
 
@@ -701,6 +682,9 @@ struct GpuFrame* GpuContextCreateFrame(struct GpuContext* gpu_context,
       goto rollback_textures;
     }
   }
+
+  for (size_t i = 0; i < nplanes; i++)
+    gpu_frame_impl->dmabuf_fds[i] = planes[i].dmabuf_fd;
   return (struct GpuFrame*)gpu_frame_impl;
 
 rollback_textures:
@@ -713,11 +697,7 @@ rollback_images:
     if (gpu_frame_impl->images[i - 1] != EGL_NO_IMAGE)
       eglDestroyImage(gpu_context->device, gpu_frame_impl->images[i - 1]);
   }
-rollback_dmabuf_fds:
-  for (size_t i = LENGTH(gpu_frame_impl->dmabuf_fds); i; i--) {
-    if (gpu_frame_impl->dmabuf_fds[i - 1] != -1)
-      close(gpu_frame_impl->dmabuf_fds[i - 1]);
-  }
+rollback_gpu_frame:
   free(gpu_frame_impl);
   return NULL;
 }
@@ -790,10 +770,7 @@ void GpuContextDestroyFrame(struct GpuContext* gpu_context,
     if (gpu_frame_impl->images[i - 1] != EGL_NO_IMAGE)
       eglDestroyImage(gpu_context->device, gpu_frame_impl->images[i - 1]);
   }
-  for (size_t i = LENGTH(gpu_frame_impl->dmabuf_fds); i; i--) {
-    if (gpu_frame_impl->dmabuf_fds[i - 1] != -1)
-      close(gpu_frame_impl->dmabuf_fds[i - 1]);
-  }
+  CloseUniqueFds(gpu_frame_impl->dmabuf_fds);
   free(gpu_frame_impl);
 }
 
@@ -811,4 +788,13 @@ void GpuContextDestroy(struct GpuContext* gpu_context) {
   close(gpu_context->render_node);
 #endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
   free(gpu_context);
+}
+
+void CloseUniqueFds(int fds[4]) {
+  // TODO(mburakov): Meh, but still better than looping...
+  if (fds[3] != -1 && fds[3] != fds[2] && fds[3] != fds[1] && fds[3] != fds[0])
+    close(fds[3]);
+  if (fds[2] != -1 && fds[2] != fds[1] && fds[2] != fds[0]) close(fds[2]);
+  if (fds[1] != -1 && fds[1] != fds[0]) close(fds[1]);
+  if (fds[0] != -1) close(fds[0]);
 }

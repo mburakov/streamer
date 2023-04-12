@@ -17,6 +17,7 @@
 
 #include "capture.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -140,8 +141,16 @@ const struct GpuFrame* CaptureContextGetFrame(
     capture_context->gpu_frame = NULL;
   }
 
+  struct GpuFramePlane planes[] = {
+      {.dmabuf_fd = -1},
+      {.dmabuf_fd = -1},
+      {.dmabuf_fd = -1},
+      {.dmabuf_fd = -1},
+  };
+  static_assert(LENGTH(planes) == LENGTH(drm_mode_fb_cmd2.handles),
+                "Suspicious drm_mode_fb_cmd2 structure");
+
   size_t nplanes = 0;
-  struct GpuFramePlane planes[LENGTH(drm_mode_fb_cmd2.handles)];
   for (; nplanes < LENGTH(planes); nplanes++) {
     if (!drm_mode_fb_cmd2.handles[nplanes]) break;
     int status = drmPrimeHandleToFD(capture_context->drm_fd,
@@ -159,10 +168,16 @@ const struct GpuFrame* CaptureContextGetFrame(
   capture_context->gpu_frame = GpuContextCreateFrame(
       capture_context->gpu_context, drm_mode_fb_cmd2.width,
       drm_mode_fb_cmd2.height, drm_mode_fb_cmd2.pixel_format, nplanes, planes);
+  if (!capture_context->gpu_frame) {
+    LOG("Failed to create gpu frame");
+    goto release_planes;
+  }
+  return capture_context->gpu_frame;
 
 release_planes:
-  for (; nplanes; nplanes--) close(planes[nplanes - 1].dmabuf_fd);
-  return capture_context->gpu_frame;
+  CloseUniqueFds((int[]){planes[0].dmabuf_fd, planes[1].dmabuf_fd,
+                         planes[2].dmabuf_fd, planes[3].dmabuf_fd});
+  return NULL;
 }
 
 void CaptureContextDestroy(struct CaptureContext* capture_context) {

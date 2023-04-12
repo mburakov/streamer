@@ -49,4 +49,6 @@ void GpuContextDestroyFrame(struct GpuContext* gpu_context,
                             struct GpuFrame* gpu_frame);
 void GpuContextDestroy(struct GpuContext* gpu_context);
 
+void CloseUniqueFds(int fds[4]);
+
 #endif  // STREAMER_GPU_H_

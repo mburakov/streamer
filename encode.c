@@ -17,6 +17,7 @@
 
 #include "encode.h"
 
+#include <assert.h>
 #include <drm_fourcc.h>
 #include <errno.h>
 #include <libavcodec/avcodec.h>
@@ -154,10 +155,17 @@ rollback_encode_context:
 
 static struct GpuFrame* PrimeToGpuFrame(
     struct GpuContext* gpu_context, const VADRMPRIMESurfaceDescriptor* prime) {
-  struct GpuFramePlane planes[4];
+  struct GpuFramePlane planes[] = {
+      {.dmabuf_fd = -1},
+      {.dmabuf_fd = -1},
+      {.dmabuf_fd = -1},
+      {.dmabuf_fd = -1},
+  };
+  static_assert(LENGTH(planes) == LENGTH(prime->layers[0].object_index),
+                "Suspicious VADRMPRIMESurfaceDescriptor structure");
+
   for (size_t i = 0; i < prime->layers[0].num_planes; i++) {
     uint32_t object_index = prime->layers[0].object_index[i];
-    if (prime->objects[object_index].fd == -1) break;
     planes[i] = (struct GpuFramePlane){
         .dmabuf_fd = prime->objects[object_index].fd,
         .pitch = prime->layers[0].pitch[i],
@@ -165,11 +173,20 @@ static struct GpuFrame* PrimeToGpuFrame(
         .modifier = prime->objects[object_index].drm_format_modifier,
     };
   }
+
   struct GpuFrame* gpu_frame =
       GpuContextCreateFrame(gpu_context, prime->width, prime->height,
                             prime->fourcc, prime->layers[0].num_planes, planes);
-  for (size_t i = prime->num_objects; i; i--) close(prime->objects[i - 1].fd);
+  if (!gpu_frame) {
+    LOG("Failed to create gpu frame");
+    goto release_planes;
+  }
   return gpu_frame;
+
+release_planes:
+  CloseUniqueFds((int[]){planes[0].dmabuf_fd, planes[1].dmabuf_fd,
+                         planes[2].dmabuf_fd, planes[3].dmabuf_fd});
+  return NULL;
 }
 
 const struct GpuFrame* EncodeContextGetFrame(
