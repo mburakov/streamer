@@ -24,7 +24,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <xf86drm.h>
-#include <xf86drmMode.h>
 
 #include "gpu.h"
 #include "toolbox/utils.h"
@@ -53,34 +52,35 @@ static int OpenAnyModule(void) {
   return -1;
 }
 
-static bool IsCrtcComplete(int drm_fd, uint32_t crtc_id) {
-  drmModeCrtcPtr crtc = drmModeGetCrtc(drm_fd, crtc_id);
-  if (!crtc) {
+static bool GetCrtcFb(int drm_fd, uint32_t crtc_id,
+                      struct drm_mode_fb_cmd2* drm_mode_fb_cmd2) {
+  struct drm_mode_crtc drm_mode_crtc = {
+      .crtc_id = crtc_id,
+  };
+  if (drmIoctl(drm_fd, DRM_IOCTL_MODE_GETCRTC, &drm_mode_crtc)) {
     LOG("Failed to get crtc %u (%s)", crtc_id, strerror(errno));
     return false;
   }
-  bool result = false;
-  if (!crtc->buffer_id) {
+  if (!drm_mode_crtc.fb_id) {
     LOG("Crtc %u has no framebuffer", crtc_id);
-    goto rollback_crtc;
+    return false;
   }
 
-  drmModeFB2Ptr fb2 = drmModeGetFB2(drm_fd, crtc->buffer_id);
-  if (!fb2) {
-    LOG("Failed to get framebuffer %u (%s)", crtc->buffer_id, strerror(errno));
-    goto rollback_crtc;
+  struct drm_mode_fb_cmd2 result = {
+      .fb_id = drm_mode_crtc.fb_id,
+  };
+  if (drmIoctl(drm_fd, DRM_IOCTL_MODE_GETFB2, &result)) {
+    LOG("Failed to get framebuffer %u (%s)", drm_mode_crtc.fb_id,
+        strerror(errno));
+    return false;
   }
-  if (!fb2->handles[0]) {
-    LOG("Framebuffer %u has no handles", crtc->buffer_id);
-    goto rollback_fb2;
+  if (!result.handles[0]) {
+    LOG("Framebuffer %u has no handles", drm_mode_crtc.fb_id);
+    return false;
   }
-  result = true;
 
-rollback_fb2:
-  drmModeFreeFB2(fb2);
-rollback_crtc:
-  drmModeFreeCrtc(crtc);
-  return result;
+  if (drm_mode_fb_cmd2) *drm_mode_fb_cmd2 = result;
+  return true;
 }
 
 struct CaptureContext* CaptureContextCreate(struct GpuContext* gpu_context) {
@@ -101,23 +101,24 @@ struct CaptureContext* CaptureContextCreate(struct GpuContext* gpu_context) {
     goto rollback_capture_context;
   }
 
-  drmModeResPtr res = drmModeGetResources(capture_context->drm_fd);
-  if (!res) {
+  uint32_t crtc_ids[16];
+  struct drm_mode_card_res drm_mode_card_res = {
+      .crtc_id_ptr = (uintptr_t)crtc_ids,
+      .count_crtcs = LENGTH(crtc_ids),
+  };
+  if (drmIoctl(capture_context->drm_fd, DRM_IOCTL_MODE_GETRESOURCES,
+               &drm_mode_card_res)) {
     LOG("Failed to get drm mode resources (%s)", strerror(errno));
     goto rollback_drm_fd;
   }
-
-  for (int i = 0; i < res->count_crtcs; i++) {
-    if (IsCrtcComplete(capture_context->drm_fd, res->crtcs[i])) {
-      LOG("Capturing crtc %u", res->crtcs[i]);
-      capture_context->crtc_id = res->crtcs[i];
-      drmModeFreeResources(res);
+  for (size_t i = 0; i < drm_mode_card_res.count_crtcs; i++) {
+    if (GetCrtcFb(capture_context->drm_fd, crtc_ids[i], NULL)) {
+      LOG("Capturing crtc %u", crtc_ids[i]);
+      capture_context->crtc_id = crtc_ids[i];
       return capture_context;
     }
   }
-
   LOG("Nothing to capture");
-  drmModeFreeResources(res);
 
 rollback_drm_fd:
   drmClose(capture_context->drm_fd);
@@ -126,66 +127,41 @@ rollback_capture_context:
   return NULL;
 }
 
-static struct GpuFrame* WrapFramebuffer(int drm_fd, drmModeFB2Ptr fb2,
-                                        struct GpuContext* gpu_context) {
+const struct GpuFrame* CaptureContextGetFrame(
+    struct CaptureContext* capture_context) {
+  struct drm_mode_fb_cmd2 drm_mode_fb_cmd2;
+  if (!GetCrtcFb(capture_context->drm_fd, capture_context->crtc_id,
+                 &drm_mode_fb_cmd2))
+    return NULL;
+
+  if (capture_context->gpu_frame) {
+    GpuFrameDestroy(capture_context->gpu_frame);
+    capture_context->gpu_frame = NULL;
+  }
+
   size_t nplanes = 0;
-  struct GpuFrame* result = NULL;
-  struct GpuFramePlane planes[LENGTH(fb2->handles)];
-  for (; nplanes < LENGTH(planes) && fb2->handles[nplanes]; nplanes++) {
-    int status = drmPrimeHandleToFD(drm_fd, fb2->handles[nplanes], 0,
+  struct GpuFramePlane planes[LENGTH(drm_mode_fb_cmd2.handles)];
+  for (; nplanes < LENGTH(planes); nplanes++) {
+    if (!drm_mode_fb_cmd2.handles[nplanes]) break;
+    int status = drmPrimeHandleToFD(capture_context->drm_fd,
+                                    drm_mode_fb_cmd2.handles[nplanes], 0,
                                     &planes[nplanes].dmabuf_fd);
     if (status) {
       LOG("Failed to get dmabuf fd (%d)", status);
       goto release_planes;
     }
-    planes[nplanes].offset = fb2->offsets[nplanes];
-    planes[nplanes].pitch = fb2->pitches[nplanes];
-    // TODO(mburakov): Structure of drmModeFB2 implies that all the planes have
-    // the same modifier. At the same time, surrounding code supports per-plane
-    // modifiers. So right now a drmModeFB2-wide modifier is just copypasted
-    // into each plane descriptor.
-    planes[nplanes].modifier = fb2->modifier;
+    planes[nplanes].offset = drm_mode_fb_cmd2.offsets[nplanes];
+    planes[nplanes].pitch = drm_mode_fb_cmd2.pitches[nplanes];
+    planes[nplanes].modifier = drm_mode_fb_cmd2.modifier[nplanes];
   }
 
-  result = GpuFrameCreate(gpu_context, fb2->width, fb2->height,
-                          fb2->pixel_format, nplanes, planes);
-  if (!result) LOG("Failed to create gpu frame");
+  capture_context->gpu_frame = GpuFrameCreate(
+      capture_context->gpu_context, drm_mode_fb_cmd2.width,
+      drm_mode_fb_cmd2.height, drm_mode_fb_cmd2.pixel_format, nplanes, planes);
 
 release_planes:
   for (; nplanes; nplanes--) close(planes[nplanes - 1].dmabuf_fd);
-  return result;
-}
-
-const struct GpuFrame* CaptureContextGetFrame(
-    struct CaptureContext* capture_context) {
-  drmModeCrtcPtr crtc =
-      drmModeGetCrtc(capture_context->drm_fd, capture_context->crtc_id);
-  if (!crtc) {
-    LOG("Failed to get crtc %u", capture_context->crtc_id);
-    return NULL;
-  }
-
-  struct GpuFrame* gpu_frame = NULL;
-  drmModeFB2Ptr fb2 = drmModeGetFB2(capture_context->drm_fd, crtc->buffer_id);
-  if (!fb2) {
-    LOG("Failed to get framebuffer %u", crtc->buffer_id);
-    goto rollback_crtc;
-  }
-  if (!fb2->handles[0]) {
-    LOG("Framebuffer %u has no handles", crtc->buffer_id);
-    goto rollback_fb2;
-  }
-
-  if (capture_context->gpu_frame) GpuFrameDestroy(capture_context->gpu_frame);
-  capture_context->gpu_frame = WrapFramebuffer(capture_context->drm_fd, fb2,
-                                               capture_context->gpu_context);
-  gpu_frame = capture_context->gpu_frame;
-
-rollback_fb2:
-  drmModeFreeFB2(fb2);
-rollback_crtc:
-  drmModeFreeCrtc(crtc);
-  return gpu_frame;
+  return capture_context->gpu_frame;
 }
 
 void CaptureContextDestroy(struct CaptureContext* capture_context) {
