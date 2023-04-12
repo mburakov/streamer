@@ -37,11 +37,11 @@
 #include "toolbox/utils.h"
 
 #define _(...) __VA_ARGS__
-#define LOOKUP_FUNCTION(a, b)                 \
+#define LOOKUP_FUNCTION(a, b, c)              \
   gpu_context->b = (a)eglGetProcAddress(#b);  \
   if (!gpu_context->b) {                      \
     LOG("Failed to look up " #b " function"); \
-    goto rollback_display;                    \
+    goto c;                                   \
   }
 
 // TODO(mburakov): It should be theoretically possible to do everything in a
@@ -343,8 +343,10 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
       !HasExtension(egl_ext, "EGL_EXT_image_dma_buf_import") ||
       !HasExtension(egl_ext, "EGL_EXT_image_dma_buf_import_modifiers"))
     goto rollback_display;
-  LOOKUP_FUNCTION(PFNEGLQUERYDMABUFFORMATSEXTPROC, eglQueryDmaBufFormatsEXT)
-  LOOKUP_FUNCTION(PFNEGLQUERYDMABUFMODIFIERSEXTPROC, eglQueryDmaBufModifiersEXT)
+  LOOKUP_FUNCTION(PFNEGLQUERYDMABUFFORMATSEXTPROC, eglQueryDmaBufFormatsEXT,
+                  rollback_display)
+  LOOKUP_FUNCTION(PFNEGLQUERYDMABUFMODIFIERSEXTPROC, eglQueryDmaBufModifiersEXT,
+                  rollback_display)
 
   if (!eglBindAPI(EGL_OPENGL_ES_API)) {
     LOG("Failed to bind egl api (%s)", EglErrorString(eglGetError()));
@@ -379,7 +381,7 @@ struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
   LOG("GL_EXTENSIONS: %s", gl_ext);
   if (!HasExtension(gl_ext, "GL_OES_EGL_image")) goto rollback_context;
   LOOKUP_FUNCTION(PFNGLEGLIMAGETARGETTEXTURE2DOESPROC,
-                  glEGLImageTargetTexture2DOES)
+                  glEGLImageTargetTexture2DOES, rollback_context)
 
   gpu_context->program_luma =
       CreateGlProgram(_binary_vertex_glsl_start, _binary_vertex_glsl_end,
