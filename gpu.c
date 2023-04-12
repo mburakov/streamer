@@ -20,6 +20,7 @@
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include <GLES3/gl32.h>
 #include <drm_fourcc.h>
 #include <errno.h>
@@ -27,9 +28,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-// mburakov: Must be included after GLES2/gl2.h
-#include <GLES2/gl2ext.h>
 
 #ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
 #include <fcntl.h>
@@ -77,9 +75,8 @@ struct GpuContext {
   GLuint vertices;
 };
 
-struct GpuFrame {
-  struct GpuContext* gpu_context;
-  uint32_t width, height;
+struct GpuFrameImpl {
+  struct GpuFrame size;
   int dmabuf_fds[4];
   EGLImage images[2];
   GLuint textures[2];
@@ -449,33 +446,6 @@ rollback_gpu_context:
   return NULL;
 }
 
-bool GpuContextSync(struct GpuContext* gpu_context) {
-  EGLSync sync = eglCreateSync(gpu_context->display, EGL_SYNC_FENCE, NULL);
-  if (sync == EGL_NO_SYNC) {
-    LOG("Failed to create egl fence sync (%s)", EglErrorString(eglGetError()));
-    return false;
-  }
-  eglClientWaitSync(gpu_context->display, sync, 0, EGL_FOREVER);
-  eglDestroySync(gpu_context->display, sync);
-  return true;
-}
-
-void GpuContextDestroy(struct GpuContext* gpu_context) {
-  glDeleteBuffers(1, &gpu_context->vertices);
-  glDeleteFramebuffers(1, &gpu_context->framebuffer);
-  glDeleteProgram(gpu_context->program_chroma);
-  glDeleteProgram(gpu_context->program_luma);
-  eglMakeCurrent(gpu_context->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                 EGL_NO_CONTEXT);
-  eglDestroyContext(gpu_context->display, gpu_context->context);
-  eglTerminate(gpu_context->display);
-#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
-  gbm_device_destroy(gpu_context->device);
-  close(gpu_context->render_node);
-#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
-  free(gpu_context);
-}
-
 static void DumpEglImageParams(const EGLAttrib* attribs) {
   for (; *attribs != EGL_NONE; attribs += 2) {
     switch (attribs[0]) {
@@ -665,26 +635,25 @@ static GLuint CreateTexture(struct GpuContext* gpu_context, EGLImage image) {
   return texture;
 }
 
-struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
-                                uint32_t height, uint32_t fourcc,
-                                size_t nplanes,
-                                const struct GpuFramePlane* planes) {
-  struct GpuFrame* gpu_frame = malloc(sizeof(struct GpuFrame));
-  if (!gpu_frame) {
+struct GpuFrame* GpuContextCreateFrame(struct GpuContext* gpu_context,
+                                       uint32_t width, uint32_t height,
+                                       uint32_t fourcc, size_t nplanes,
+                                       const struct GpuFramePlane* planes) {
+  struct GpuFrameImpl* gpu_frame_impl = malloc(sizeof(struct GpuFrameImpl));
+  if (!gpu_frame_impl) {
     LOG("Failed to allocate gpu frame (%s)", strerror(errno));
     return NULL;
   }
-  *gpu_frame = (struct GpuFrame){
-      .gpu_context = gpu_context,
-      .width = width,
-      .height = height,
+  *gpu_frame_impl = (struct GpuFrameImpl){
+      .size.width = width,
+      .size.height = height,
       .dmabuf_fds = {-1, -1, -1, -1},
       .images = {EGL_NO_IMAGE, EGL_NO_IMAGE},
   };
 
   for (size_t i = 0; i < nplanes; i++) {
-    gpu_frame->dmabuf_fds[i] = dup(planes[i].dmabuf_fd);
-    if (gpu_frame->dmabuf_fds[i] == -1) {
+    gpu_frame_impl->dmabuf_fds[i] = dup(planes[i].dmabuf_fd);
+    if (gpu_frame_impl->dmabuf_fds[i] == -1) {
       LOG("Failed to dup dmabuf fd (%s)", strerror(errno));
       goto rollback_dmabuf_fds;
     }
@@ -693,7 +662,7 @@ struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
   struct GpuFramePlane dummy_planes[4];
   for (size_t i = 0; i < nplanes; i++) {
     dummy_planes[i] = (struct GpuFramePlane){
-        .dmabuf_fd = gpu_frame->dmabuf_fds[i],
+        .dmabuf_fd = gpu_frame_impl->dmabuf_fds[i],
         .offset = planes[i].offset,
         .pitch = planes[i].pitch,
         .modifier = planes[i].modifier,
@@ -701,59 +670,56 @@ struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
   }
 
   if (fourcc == DRM_FORMAT_NV12) {
-    gpu_frame->images[0] = CreateEglImage(gpu_context, width, height,
-                                          DRM_FORMAT_R8, 1, &dummy_planes[0]);
-    if (gpu_frame->images[0] == EGL_NO_IMAGE) {
+    gpu_frame_impl->images[0] = CreateEglImage(
+        gpu_context, width, height, DRM_FORMAT_R8, 1, &dummy_planes[0]);
+    if (gpu_frame_impl->images[0] == EGL_NO_IMAGE) {
       LOG("Failed to create luma plane image");
       goto rollback_dmabuf_fds;
     }
-    gpu_frame->images[1] = CreateEglImage(gpu_context, width / 2, height / 2,
-                                          DRM_FORMAT_GR88, 1, &dummy_planes[1]);
-    if (gpu_frame->images[1] == EGL_NO_IMAGE) {
+    gpu_frame_impl->images[1] =
+        CreateEglImage(gpu_context, width / 2, height / 2, DRM_FORMAT_GR88, 1,
+                       &dummy_planes[1]);
+    if (gpu_frame_impl->images[1] == EGL_NO_IMAGE) {
       LOG("Failed to create chroma plane image");
       goto rollback_images;
     }
   } else {
-    gpu_frame->images[0] = CreateEglImage(gpu_context, width, height, fourcc,
-                                          nplanes, dummy_planes);
-    if (gpu_frame->images[0] == EGL_NO_IMAGE) {
+    gpu_frame_impl->images[0] = CreateEglImage(gpu_context, width, height,
+                                               fourcc, nplanes, dummy_planes);
+    if (gpu_frame_impl->images[0] == EGL_NO_IMAGE) {
       LOG("Failed to create multiplanar image");
       goto rollback_dmabuf_fds;
     }
   }
 
-  for (size_t i = 0; i < LENGTH(gpu_frame->images); i++) {
-    if (gpu_frame->images[i] == EGL_NO_IMAGE) break;
-    gpu_frame->textures[i] = CreateTexture(gpu_context, gpu_frame->images[i]);
-    if (!gpu_frame->textures[i]) {
+  for (size_t i = 0; i < LENGTH(gpu_frame_impl->images); i++) {
+    if (gpu_frame_impl->images[i] == EGL_NO_IMAGE) break;
+    gpu_frame_impl->textures[i] =
+        CreateTexture(gpu_context, gpu_frame_impl->images[i]);
+    if (!gpu_frame_impl->textures[i]) {
       LOG("Failed to create texture");
       goto rollback_textures;
     }
   }
-  return gpu_frame;
+  return (struct GpuFrame*)gpu_frame_impl;
 
 rollback_textures:
-  for (size_t i = LENGTH(gpu_frame->textures); i; i--) {
-    if (gpu_frame->textures[i - 1])
-      glDeleteTextures(1, &gpu_frame->textures[i - 1]);
+  for (size_t i = LENGTH(gpu_frame_impl->textures); i; i--) {
+    if (gpu_frame_impl->textures[i - 1])
+      glDeleteTextures(1, &gpu_frame_impl->textures[i - 1]);
   }
 rollback_images:
-  for (size_t i = LENGTH(gpu_frame->images); i; i--) {
-    if (gpu_frame->images[i - 1] != EGL_NO_IMAGE)
-      eglDestroyImage(gpu_frame->gpu_context->device, gpu_frame->images[i - 1]);
+  for (size_t i = LENGTH(gpu_frame_impl->images); i; i--) {
+    if (gpu_frame_impl->images[i - 1] != EGL_NO_IMAGE)
+      eglDestroyImage(gpu_context->device, gpu_frame_impl->images[i - 1]);
   }
 rollback_dmabuf_fds:
-  for (size_t i = LENGTH(gpu_frame->dmabuf_fds); i; i--) {
-    if (gpu_frame->dmabuf_fds[i - 1] != -1) close(gpu_frame->dmabuf_fds[i - 1]);
+  for (size_t i = LENGTH(gpu_frame_impl->dmabuf_fds); i; i--) {
+    if (gpu_frame_impl->dmabuf_fds[i - 1] != -1)
+      close(gpu_frame_impl->dmabuf_fds[i - 1]);
   }
-  free(gpu_frame);
+  free(gpu_frame_impl);
   return NULL;
-}
-
-void GpuFrameGetSize(const struct GpuFrame* gpu_frame, uint32_t* width,
-                     uint32_t* height) {
-  *width = gpu_frame->width;
-  *height = gpu_frame->height;
 }
 
 static bool GpuFrameConvertImpl(GLuint from, GLuint to) {
@@ -775,10 +741,15 @@ static bool GpuFrameConvertImpl(GLuint from, GLuint to) {
   return true;
 }
 
-bool GpuFrameConvert(const struct GpuFrame* from, const struct GpuFrame* to) {
-  glUseProgram(from->gpu_context->program_luma);
+bool GpuContextConvertFrame(struct GpuContext* gpu_context,
+                            const struct GpuFrame* from,
+                            const struct GpuFrame* to) {
+  const struct GpuFrameImpl* from_impl = (const void*)from;
+  const struct GpuFrameImpl* to_impl = (const void*)to;
+
+  glUseProgram(gpu_context->program_luma);
   glViewport(0, 0, (GLsizei)to->width, (GLsizei)to->height);
-  if (!GpuFrameConvertImpl(from->textures[0], to->textures[0])) {
+  if (!GpuFrameConvertImpl(from_impl->textures[0], to_impl->textures[0])) {
     LOG("Failed to convert luma plane");
     return false;
   }
@@ -790,27 +761,54 @@ bool GpuFrameConvert(const struct GpuFrame* from, const struct GpuFrame* to) {
       _(1.f / (GLfloat)from->width, 1.f / (GLfloat)from->height),
   };
 
-  glUseProgram(from->gpu_context->program_chroma);
-  glUniform2fv(from->gpu_context->sample_offsets, 4, sample_offsets);
+  glUseProgram(gpu_context->program_chroma);
+  glUniform2fv(gpu_context->sample_offsets, 4, sample_offsets);
   glViewport(0, 0, (GLsizei)to->width / 2, (GLsizei)to->height / 2);
-  if (!GpuFrameConvertImpl(from->textures[0], to->textures[1])) {
+  if (!GpuFrameConvertImpl(from_impl->textures[0], to_impl->textures[1])) {
     LOG("Failed to convert chroma plane");
     return false;
   }
+
+  EGLSync sync = eglCreateSync(gpu_context->display, EGL_SYNC_FENCE, NULL);
+  if (sync == EGL_NO_SYNC) {
+    LOG("Failed to create egl fence sync (%s)", EglErrorString(eglGetError()));
+    return false;
+  }
+  eglClientWaitSync(gpu_context->display, sync, 0, EGL_FOREVER);
+  eglDestroySync(gpu_context->display, sync);
   return true;
 }
 
-void GpuFrameDestroy(struct GpuFrame* gpu_frame) {
-  for (size_t i = LENGTH(gpu_frame->textures); i; i--) {
-    if (gpu_frame->textures[i - 1])
-      glDeleteTextures(1, &gpu_frame->textures[i - 1]);
+void GpuContextDestroyFrame(struct GpuContext* gpu_context,
+                            struct GpuFrame* gpu_frame) {
+  struct GpuFrameImpl* gpu_frame_impl = (void*)gpu_frame;
+  for (size_t i = LENGTH(gpu_frame_impl->textures); i; i--) {
+    if (gpu_frame_impl->textures[i - 1])
+      glDeleteTextures(1, &gpu_frame_impl->textures[i - 1]);
   }
-  for (size_t i = LENGTH(gpu_frame->images); i; i--) {
-    if (gpu_frame->images[i - 1] != EGL_NO_IMAGE)
-      eglDestroyImage(gpu_frame->gpu_context->device, gpu_frame->images[i - 1]);
+  for (size_t i = LENGTH(gpu_frame_impl->images); i; i--) {
+    if (gpu_frame_impl->images[i - 1] != EGL_NO_IMAGE)
+      eglDestroyImage(gpu_context->device, gpu_frame_impl->images[i - 1]);
   }
-  for (size_t i = LENGTH(gpu_frame->dmabuf_fds); i; i--) {
-    if (gpu_frame->dmabuf_fds[i - 1] != -1) close(gpu_frame->dmabuf_fds[i - 1]);
+  for (size_t i = LENGTH(gpu_frame_impl->dmabuf_fds); i; i--) {
+    if (gpu_frame_impl->dmabuf_fds[i - 1] != -1)
+      close(gpu_frame_impl->dmabuf_fds[i - 1]);
   }
-  free(gpu_frame);
+  free(gpu_frame_impl);
+}
+
+void GpuContextDestroy(struct GpuContext* gpu_context) {
+  glDeleteBuffers(1, &gpu_context->vertices);
+  glDeleteFramebuffers(1, &gpu_context->framebuffer);
+  glDeleteProgram(gpu_context->program_chroma);
+  glDeleteProgram(gpu_context->program_luma);
+  eglMakeCurrent(gpu_context->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                 EGL_NO_CONTEXT);
+  eglDestroyContext(gpu_context->display, gpu_context->context);
+  eglTerminate(gpu_context->display);
+#ifndef USE_EGL_MESA_PLATFORM_SURFACELESS
+  gbm_device_destroy(gpu_context->device);
+  close(gpu_context->render_node);
+#endif  // USE_EGL_MESA_PLATFORM_SURFACELESS
+  free(gpu_context);
 }

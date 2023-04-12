@@ -143,10 +143,9 @@ static void OnTimerExpire(void* user) {
   }
 
   if (!contexts->encode_context) {
-    uint32_t width, height;
-    GpuFrameGetSize(captured_frame, &width, &height);
-    contexts->encode_context = EncodeContextCreate(contexts->gpu_context, width,
-                                                   height, colorspace, range);
+    contexts->encode_context =
+        EncodeContextCreate(contexts->gpu_context, captured_frame->width,
+                            captured_frame->height, colorspace, range);
     if (!contexts->encode_context) {
       LOG("Failed to create encode context");
       goto drop_client;
@@ -159,12 +158,11 @@ static void OnTimerExpire(void* user) {
     LOG("Failed to get encoded frame");
     goto drop_client;
   }
-  if (!GpuFrameConvert(captured_frame, encoded_frame)) {
+  if (!GpuContextConvertFrame(contexts->gpu_context, captured_frame,
+                              encoded_frame)) {
     LOG("Failed to convert frame");
     goto drop_client;
   }
-
-  GpuContextSync(contexts->gpu_context);
   if (!EncodeContextEncodeFrame(contexts->encode_context,
                                 contexts->client_fd)) {
     LOG("Failed to encode frame");

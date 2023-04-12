@@ -166,8 +166,8 @@ static struct GpuFrame* PrimeToGpuFrame(
     };
   }
   struct GpuFrame* gpu_frame =
-      GpuFrameCreate(gpu_context, prime->width, prime->height, prime->fourcc,
-                     prime->layers[0].num_planes, planes);
+      GpuContextCreateFrame(gpu_context, prime->width, prime->height,
+                            prime->fourcc, prime->layers[0].num_planes, planes);
   for (size_t i = prime->num_objects; i; i--) close(prime->objects[i - 1].fd);
   return gpu_frame;
 }
@@ -248,7 +248,8 @@ static bool DrainPacket(const struct AVPacket* packet, int fd) {
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
   bool result = false;
   if (encode_context->gpu_frame) {
-    GpuFrameDestroy(encode_context->gpu_frame);
+    GpuContextDestroyFrame(encode_context->gpu_context,
+                           encode_context->gpu_frame);
     encode_context->gpu_frame = NULL;
   }
   AVPacket* packet = av_packet_alloc();
@@ -293,7 +294,10 @@ rollback_hw_frame:
 }
 
 void EncodeContextDestroy(struct EncodeContext* encode_context) {
-  if (encode_context->gpu_frame) GpuFrameDestroy(encode_context->gpu_frame);
+  if (encode_context->gpu_frame) {
+    GpuContextDestroyFrame(encode_context->gpu_context,
+                           encode_context->gpu_frame);
+  }
   if (encode_context->hw_frame) av_frame_free(&encode_context->hw_frame);
   avcodec_free_context(&encode_context->codec_context);
   av_buffer_unref(&encode_context->hwdevice_context);

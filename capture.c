@@ -135,7 +135,8 @@ const struct GpuFrame* CaptureContextGetFrame(
     return NULL;
 
   if (capture_context->gpu_frame) {
-    GpuFrameDestroy(capture_context->gpu_frame);
+    GpuContextDestroyFrame(capture_context->gpu_context,
+                           capture_context->gpu_frame);
     capture_context->gpu_frame = NULL;
   }
 
@@ -155,7 +156,7 @@ const struct GpuFrame* CaptureContextGetFrame(
     planes[nplanes].modifier = drm_mode_fb_cmd2.modifier[nplanes];
   }
 
-  capture_context->gpu_frame = GpuFrameCreate(
+  capture_context->gpu_frame = GpuContextCreateFrame(
       capture_context->gpu_context, drm_mode_fb_cmd2.width,
       drm_mode_fb_cmd2.height, drm_mode_fb_cmd2.pixel_format, nplanes, planes);
 
@@ -165,7 +166,10 @@ release_planes:
 }
 
 void CaptureContextDestroy(struct CaptureContext* capture_context) {
-  if (capture_context->gpu_frame) GpuFrameDestroy(capture_context->gpu_frame);
+  if (capture_context->gpu_frame) {
+    GpuContextDestroyFrame(capture_context->gpu_context,
+                           capture_context->gpu_frame);
+  }
   drmClose(capture_context->drm_fd);
   free(capture_context);
 }

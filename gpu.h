@@ -24,6 +24,11 @@
 
 #include "colorspace.h"
 
+struct GpuFrame {
+  uint32_t width;
+  uint32_t height;
+};
+
 struct GpuFramePlane {
   int dmabuf_fd;
   uint32_t pitch;
@@ -33,16 +38,15 @@ struct GpuFramePlane {
 
 struct GpuContext* GpuContextCreate(enum YuvColorspace colorspace,
                                     enum YuvRange range);
-bool GpuContextSync(struct GpuContext* gpu_context);
+struct GpuFrame* GpuContextCreateFrame(struct GpuContext* gpu_context,
+                                       uint32_t width, uint32_t height,
+                                       uint32_t fourcc, size_t nplanes,
+                                       const struct GpuFramePlane* planes);
+bool GpuContextConvertFrame(struct GpuContext* gpu_context,
+                            const struct GpuFrame* from,
+                            const struct GpuFrame* to);
+void GpuContextDestroyFrame(struct GpuContext* gpu_context,
+                            struct GpuFrame* gpu_frame);
 void GpuContextDestroy(struct GpuContext* gpu_context);
-
-struct GpuFrame* GpuFrameCreate(struct GpuContext* gpu_context, uint32_t width,
-                                uint32_t height, uint32_t fourcc,
-                                size_t nplanes,
-                                const struct GpuFramePlane* planes);
-void GpuFrameGetSize(const struct GpuFrame* gpu_frame, uint32_t* width,
-                     uint32_t* height);
-bool GpuFrameConvert(const struct GpuFrame* from, const struct GpuFrame* to);
-void GpuFrameDestroy(struct GpuFrame* gpu_frame);
 
 #endif  // STREAMER_GPU_H_
