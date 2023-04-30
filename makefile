@@ -6,6 +6,8 @@ obj+=\
 	toolbox/buffer.o \
 	toolbox/io_muxer.o
 
+obj:=$(filter-out encode.o,$(obj))
+
 libs:=\
 	egl \
 	gbm \
@@ -13,7 +15,8 @@ libs:=\
 	libavcodec \
 	libavutil \
 	libdrm \
-	libva
+	libva \
+	libva-drm
 
 res:=\
 	vertex.glsl \
