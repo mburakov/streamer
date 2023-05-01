@@ -21,14 +21,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include <va/va.h>
 #include <va/va_drm.h>
 #include <va/va_drmcommon.h>
 
+#include "bitstream.h"
 #include "encode.h"
 #include "gpu.h"
 #include "toolbox/utils.h"
+
+#define VPS_NUT 32
+#define SPS_NUT 33
+#define PPS_NUT 34
 
 #define HEVC_SLICE_P 1
 #define HEVC_SLICE_I 2
@@ -485,6 +491,87 @@ static bool UploadMiscBuffer(const struct EncodeContext* encode_context,
                       stack_allocated_storage, presult);
 }
 
+static void PackVpsRbsp(struct Bitstream* bitstream,
+                        const struct EncodeContext* encode_context) {
+  BitstreamAppend(bitstream, 32, 0x00000001);
+  BitstreamAppend(bitstream, 1, 0);  // forbidden_zero_bit
+  BitstreamAppend(bitstream, 6, VPS_NUT);
+  BitstreamAppend(bitstream, 6, 0);  // nuh_layer_id
+  BitstreamAppend(bitstream, 3, 1);  // nuh_temporal_id_plus1
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppend(bitstream, 4, 0);        // vps_video_parameter_set_id
+  BitstreamAppend(bitstream, 1, 1);        // vps_base_layer_internal_flag
+  BitstreamAppend(bitstream, 1, 1);        // vps_base_layer_available_flag
+  BitstreamAppend(bitstream, 6, 0);        // vps_max_layers_minus1
+  BitstreamAppend(bitstream, 3, 0);        // vps_max_sub_layers_minus1
+  BitstreamAppend(bitstream, 1, 1);        // vps_temporal_id_nesting_flag
+  BitstreamAppend(bitstream, 16, 0xffff);  // vps_reserved_0xffff_16bits
+
+  // mburakov: Below is profile_tier_level structure.
+  BitstreamAppend(bitstream, 2, 0);  // general_profile_space
+  BitstreamAppend(bitstream, 1, encode_context->seq.general_tier_flag);
+  BitstreamAppend(bitstream, 5, encode_context->seq.general_profile_idc);
+  BitstreamAppend(bitstream, 32,
+                  1 << (31 - encode_context->seq.general_profile_idc));
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppend(bitstream, 1, 1);   // general_progressive_source_flag
+  BitstreamAppend(bitstream, 1, 0);   // general_interlaced_source_flag
+  BitstreamAppend(bitstream, 1, 1);   // general_non_packed_constraint_flag
+  BitstreamAppend(bitstream, 1, 1);   // general_frame_only_constraint_flag
+  BitstreamAppend(bitstream, 24, 0);  // general_reserved_zero_43bits
+  BitstreamAppend(bitstream, 19, 0);  // general_reserved_zero_43bits
+  BitstreamAppend(bitstream, 1, 0);   // general_inbld_flag (TODO)
+
+  BitstreamAppend(bitstream, 8, encode_context->seq.general_level_idc);
+  // mburakov: Above is profile_tier_level structure.
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // vps_sub_layer_ordering_info_present_flag
+
+  // mburakov: No B-frames.
+  BitstreamAppendUE(bitstream, 1);   // vps_max_dec_pic_buffering_minus1 (TODO)
+  BitstreamAppendUE(bitstream, 0);   // vps_max_num_reorder_pics
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppendUE(bitstream, 0);   // vps_max_latency_increase_plus1
+  BitstreamAppend(bitstream, 6, 0);  // vps_max_layer_id
+  BitstreamAppendUE(bitstream, 0);   // vps_num_layer_sets_minus1
+  BitstreamAppend(bitstream, 1, 1);  // vps_timing_info_present_flag (TODO)
+
+  // mburakov: 60 frames per second.
+  BitstreamAppend(bitstream, 32, 1);   // vps_num_units_in_tick
+  BitstreamAppend(bitstream, 32, 60);  // vps_time_scale
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // vps_poc_proportional_to_timing_flag
+  BitstreamAppendUE(bitstream, 0);   // vps_num_hrd_parameters
+  BitstreamAppend(bitstream, 1, 0);  // vps_extension_flag
+
+  // mburakov: Below is rbsp_trailing_bits structure.
+  BitstreamAppend(bitstream, 1, 1);  // rbsp_stop_one_bit
+  BitstreamByteAlign(bitstream);     // rbsp_alignment_zero_bit
+}
+
+static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
+  for (;;) {
+    ssize_t result = writev(fd, iovec, count);
+    if (result < 0) {
+      if (errno == EINTR) continue;
+      LOG("Failed to write (%s)", strerror(errno));
+      return false;
+    }
+    for (int i = 0; i < count; i++) {
+      size_t delta = MIN((size_t)result, iovec[i].iov_len);
+      iovec[i].iov_base = (uint8_t*)iovec[i].iov_base + delta;
+      iovec[i].iov_len -= delta;
+      result -= delta;
+    }
+    if (!result) return true;
+  }
+}
+
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
   VABufferID buffers[8];
   VABufferID* buffer_ptr = buffers;
@@ -747,6 +834,25 @@ case PICTURE_TYPE_P:
     goto rollback_buffers;
   }
   LOG("GOT FRAME!");
+
+  char buffer[256];
+  struct Bitstream bitstream = {
+      .data = buffer,
+      .size = 0,
+  };
+
+  PackVpsRbsp(&bitstream, encode_context);
+
+  uint32_t total_size = (uint32_t)(bitstream.size / 8);
+  struct iovec iovec[] = {
+      {.iov_base = &total_size, .iov_len = sizeof(total_size)},
+      {.iov_base = bitstream.data, .iov_len = total_size},
+  };
+  if (!DrainBuffers(fd, iovec, LENGTH(iovec))) {
+    LOG("Failed to drain encoded frame");
+    goto rollback_buffers;
+  }
+
   result = false;
 
 rollback_buffers:
