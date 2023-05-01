@@ -493,6 +493,8 @@ static bool UploadMiscBuffer(const struct EncodeContext* encode_context,
 
 static void PackVpsRbsp(struct Bitstream* bitstream,
                         const struct EncodeContext* encode_context) {
+  const VAEncSequenceParameterBufferHEVC* seq = &encode_context->seq;
+
   BitstreamAppend(bitstream, 32, 0x00000001);
   BitstreamAppend(bitstream, 1, 0);  // forbidden_zero_bit
   BitstreamAppend(bitstream, 6, VPS_NUT);
@@ -510,10 +512,9 @@ static void PackVpsRbsp(struct Bitstream* bitstream,
 
   // mburakov: Below is profile_tier_level structure.
   BitstreamAppend(bitstream, 2, 0);  // general_profile_space
-  BitstreamAppend(bitstream, 1, encode_context->seq.general_tier_flag);
-  BitstreamAppend(bitstream, 5, encode_context->seq.general_profile_idc);
-  BitstreamAppend(bitstream, 32,
-                  1 << (31 - encode_context->seq.general_profile_idc));
+  BitstreamAppend(bitstream, 1, seq->general_tier_flag);
+  BitstreamAppend(bitstream, 5, seq->general_profile_idc);
+  BitstreamAppend(bitstream, 32, 1 << (31 - seq->general_profile_idc));
 
   // mburakov: ffmpeg hardcodes the parameters below.
   BitstreamAppend(bitstream, 1, 1);   // general_progressive_source_flag
@@ -524,15 +525,15 @@ static void PackVpsRbsp(struct Bitstream* bitstream,
   BitstreamAppend(bitstream, 19, 0);  // general_reserved_zero_43bits
   BitstreamAppend(bitstream, 1, 0);   // general_inbld_flag (TODO)
 
-  BitstreamAppend(bitstream, 8, encode_context->seq.general_level_idc);
+  BitstreamAppend(bitstream, 8, seq->general_level_idc);
   // mburakov: Above is profile_tier_level structure.
 
   // mburakov: ffmpeg hardcodes the parameters below.
   BitstreamAppend(bitstream, 1, 0);  // vps_sub_layer_ordering_info_present_flag
 
   // mburakov: No B-frames.
-  BitstreamAppendUE(bitstream, 1);   // vps_max_dec_pic_buffering_minus1 (TODO)
-  BitstreamAppendUE(bitstream, 0);   // vps_max_num_reorder_pics
+  BitstreamAppendUE(bitstream, 1);  // vps_max_dec_pic_buffering_minus1 (TODO)
+  BitstreamAppendUE(bitstream, 0);  // vps_max_num_reorder_pics
 
   // mburakov: ffmpeg hardcodes the parameters below.
   BitstreamAppendUE(bitstream, 0);   // vps_max_latency_increase_plus1
@@ -548,6 +549,108 @@ static void PackVpsRbsp(struct Bitstream* bitstream,
   BitstreamAppend(bitstream, 1, 0);  // vps_poc_proportional_to_timing_flag
   BitstreamAppendUE(bitstream, 0);   // vps_num_hrd_parameters
   BitstreamAppend(bitstream, 1, 0);  // vps_extension_flag
+
+  // mburakov: Below is rbsp_trailing_bits structure.
+  BitstreamAppend(bitstream, 1, 1);  // rbsp_stop_one_bit
+  BitstreamByteAlign(bitstream);     // rbsp_alignment_zero_bit
+}
+
+static void PackSpsRbsp(struct Bitstream* bitstream,
+                        const struct EncodeContext* encode_context) {
+  const VAEncSequenceParameterBufferHEVC* seq = &encode_context->seq;
+
+  BitstreamAppend(bitstream, 32, 0x00000001);
+  BitstreamAppend(bitstream, 1, 0);  // forbidden_zero_bit
+  BitstreamAppend(bitstream, 6, SPS_NUT);
+  BitstreamAppend(bitstream, 6, 0);  // nuh_layer_id
+  BitstreamAppend(bitstream, 3, 1);  // nuh_temporal_id_plus1
+
+  BitstreamAppend(bitstream, 4, 0);  // sps_video_parameter_set_id
+  BitstreamAppend(bitstream, 3, 0);  // sps_max_sub_layers_minus1
+  BitstreamAppend(bitstream, 1, 1);  // sps_temporal_id_nesting_flag
+
+  // mburakov: Below is profile_tier_level structure.
+  BitstreamAppend(bitstream, 2, 0);  // general_profile_space
+  BitstreamAppend(bitstream, 1, seq->general_tier_flag);
+  BitstreamAppend(bitstream, 5, seq->general_profile_idc);
+  BitstreamAppend(bitstream, 32, 1 << (31 - seq->general_profile_idc));
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppend(bitstream, 1, 1);   // general_progressive_source_flag
+  BitstreamAppend(bitstream, 1, 0);   // general_interlaced_source_flag
+  BitstreamAppend(bitstream, 1, 1);   // general_non_packed_constraint_flag
+  BitstreamAppend(bitstream, 1, 1);   // general_frame_only_constraint_flag
+  BitstreamAppend(bitstream, 24, 0);  // general_reserved_zero_43bits
+  BitstreamAppend(bitstream, 19, 0);  // general_reserved_zero_43bits
+  BitstreamAppend(bitstream, 1, 0);   // general_inbld_flag (TODO)
+
+  BitstreamAppend(bitstream, 8, seq->general_level_idc);
+  // mburakov: Above is profile_tier_level structure.
+
+  BitstreamAppendUE(bitstream, 0);  // sps_seq_parameter_set_id
+  BitstreamAppendUE(bitstream, seq->seq_fields.bits.chroma_format_idc);
+  BitstreamAppendUE(bitstream, seq->pic_width_in_luma_samples);
+  BitstreamAppendUE(bitstream, seq->pic_height_in_luma_samples);
+  if (encode_context->width != seq->pic_width_in_luma_samples ||
+      encode_context->height != seq->pic_height_in_luma_samples) {
+    uint32_t crop_win_right_offset_in_chroma_samples =
+        (seq->pic_width_in_luma_samples - encode_context->width) / 2;
+    uint32_t crop_win_bottom_offset_in_chroma_samples =
+        (seq->pic_height_in_luma_samples - encode_context->height) / 2;
+    BitstreamAppend(bitstream, 1, 1);  // conformance_window_flag
+    BitstreamAppendUE(bitstream, 0);   // conf_win_left_offset
+    BitstreamAppendUE(bitstream, crop_win_right_offset_in_chroma_samples);
+    BitstreamAppendUE(bitstream, 0);  // conf_win_top_offset
+    BitstreamAppendUE(bitstream, crop_win_bottom_offset_in_chroma_samples);
+  } else {
+    BitstreamAppend(bitstream, 1, 0);  // conformance_window_flag
+  }
+  BitstreamAppendUE(bitstream, seq->seq_fields.bits.bit_depth_luma_minus8);
+  BitstreamAppendUE(bitstream, seq->seq_fields.bits.bit_depth_chroma_minus8);
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppendUE(bitstream, 8);   // log2_max_pic_order_cnt_lsb_minus4
+  BitstreamAppend(bitstream, 1, 0);  // sps_sub_layer_ordering_info_present_flag
+
+  // mburakov: No B-frames.
+  BitstreamAppendUE(bitstream, 1);  // sps_max_dec_pic_buffering_minus1 (TODO)
+  BitstreamAppendUE(bitstream, 0);  // sps_max_num_reorder_pics
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppendUE(bitstream, 0);  // sps_max_latency_increase_plus1
+
+  BitstreamAppendUE(bitstream, seq->log2_min_luma_coding_block_size_minus3);
+  BitstreamAppendUE(bitstream, seq->log2_diff_max_min_luma_coding_block_size);
+  BitstreamAppendUE(bitstream, seq->log2_min_transform_block_size_minus2);
+  BitstreamAppendUE(bitstream, seq->log2_diff_max_min_transform_block_size);
+  BitstreamAppendUE(bitstream, seq->max_transform_hierarchy_depth_inter);
+  BitstreamAppendUE(bitstream, seq->max_transform_hierarchy_depth_intra);
+  BitstreamAppend(bitstream, 1, seq->seq_fields.bits.scaling_list_enabled_flag);
+  // mburakov: scaling list details are absent because scaling_list_enabled_flag
+  // is hardcoded to zero during sps initialization.
+  BitstreamAppend(bitstream, 1, seq->seq_fields.bits.amp_enabled_flag);
+  BitstreamAppend(bitstream, 1,
+                  seq->seq_fields.bits.sample_adaptive_offset_enabled_flag);
+  BitstreamAppend(bitstream, 1, seq->seq_fields.bits.pcm_enabled_flag);
+  // mburakov: pcm sample details are missing because pcm_enabled_flag is
+  // hardcoded to zero during sps initialization.
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppendUE(bitstream, 0);   // num_short_term_ref_pic_sets
+  BitstreamAppend(bitstream, 1, 0);  // long_term_ref_pics_present_flag
+
+  BitstreamAppend(bitstream, 1,
+                  seq->seq_fields.bits.sps_temporal_mvp_enabled_flag);
+  BitstreamAppend(bitstream, 1,
+                  seq->seq_fields.bits.strong_intra_smoothing_enabled_flag);
+  // TODO(mburakov): ffmpeg hardcodes vui_parameters_present_flag to zero for
+  // unpacked sps, but to one for packed sps. Why???
+  BitstreamAppend(bitstream, 1, 1);  // vui_parameters_present_flag
+
+#error Implement this!!!
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // sps_extension_present_flag (TODO)
 
   // mburakov: Below is rbsp_trailing_bits structure.
   BitstreamAppend(bitstream, 1, 1);  // rbsp_stop_one_bit
@@ -842,6 +945,7 @@ case PICTURE_TYPE_P:
   };
 
   PackVpsRbsp(&bitstream, encode_context);
+  PackSpsRbsp(&bitstream, encode_context);
 
   uint32_t total_size = (uint32_t)(bitstream.size / 8);
   struct iovec iovec[] = {
