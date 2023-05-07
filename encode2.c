@@ -647,7 +647,51 @@ static void PackSpsRbsp(struct Bitstream* bitstream,
   // unpacked sps, but to one for packed sps. Why???
   BitstreamAppend(bitstream, 1, 1);  // vui_parameters_present_flag
 
-#error Implement this!!!
+  // mburakov: Below is vui_parameters structure.
+  BitstreamAppend(bitstream, 1, 0);  // aspect_ratio_info_present_flag
+  BitstreamAppend(bitstream, 1, 0);  // overscan_info_present_flag
+  BitstreamAppend(bitstream, 1, 1);  // video_signal_type_present_flag
+  BitstreamAppend(bitstream, 3, 5);  // video_format
+  BitstreamAppend(bitstream, 1, 0);  // video_full_range_flag (TODO)
+  BitstreamAppend(bitstream, 1, 1);  // colour_description_present_flag
+  BitstreamAppend(bitstream, 8, 2);  // colour_primaries (TODO)
+  BitstreamAppend(bitstream, 8, 2);  // transfer_characteristics (TODO)
+  BitstreamAppend(bitstream, 8, 6);  // matrix_coeffs (TODO)
+  BitstreamAppend(bitstream, 1, 0);  // chroma_loc_info_present_flag
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // neutral_chroma_indication_flag
+  BitstreamAppend(bitstream, 1, 0);  // field_seq_flag
+  BitstreamAppend(bitstream, 1, 0);  // frame_field_info_present_flag
+  BitstreamAppend(bitstream, 1, 0);  // default_display_window_flag
+
+  BitstreamAppend(bitstream, 1, 1);  // vui_timing_info_present_flag (TODO)
+
+  // mburakov: 60 frames per second.
+  BitstreamAppend(bitstream, 32, 1);   // vui_num_units_in_tick
+  BitstreamAppend(bitstream, 32, 60);  // vui_time_scale
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // vui_poc_proportional_to_timing_flag
+  BitstreamAppend(bitstream, 1, 0);  // vui_hrd_parameters_present_flag
+  BitstreamAppend(bitstream, 1, 1);  // bitstream_restriction_flag
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // tiles_fixed_structure_flag
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppend(bitstream, 1, 1);  // motion_vectors_over_pic_boundaries_flag
+  BitstreamAppend(bitstream, 1, 1);  // restricted_ref_pic_lists_flag
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppendUE(bitstream, 0);  // min_spatial_segmentation_idc
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppendUE(bitstream, 0);   // max_bytes_per_pic_denom
+  BitstreamAppendUE(bitstream, 0);   // max_bits_per_min_cu_denom
+  BitstreamAppendUE(bitstream, 15);  // log2_max_mv_length_horizontal
+  BitstreamAppendUE(bitstream, 15);  // log2_max_mv_length_vertical
+  // mburakov: Above is vui_parameters structure.
 
   // mburakov: ffmpeg hardcodes the parameters below.
   BitstreamAppend(bitstream, 1, 0);  // sps_extension_present_flag (TODO)
