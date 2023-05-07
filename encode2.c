@@ -701,6 +701,91 @@ static void PackSpsRbsp(struct Bitstream* bitstream,
   BitstreamByteAlign(bitstream);     // rbsp_alignment_zero_bit
 }
 
+static void PackPpsRbsp(struct Bitstream* bitstream,
+                        const struct EncodeContext* encode_context) {
+  const VAEncPictureParameterBufferHEVC* pic = &encode_context->pic;
+
+  BitstreamAppend(bitstream, 32, 0x00000001);
+  BitstreamAppend(bitstream, 1, 0);  // forbidden_zero_bit
+  BitstreamAppend(bitstream, 6, PPS_NUT);
+  BitstreamAppend(bitstream, 6, 0);  // nuh_layer_id
+  BitstreamAppend(bitstream, 3, 1);  // nuh_temporal_id_plus1
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  BitstreamAppendUE(bitstream, 0);  // pps_pic_parameter_set_id
+  BitstreamAppendUE(bitstream, 0);  // pps_seq_parameter_set_id (TODO)
+
+  BitstreamAppend(bitstream, 1,
+                  pic->pic_fields.bits.dependent_slice_segments_enabled_flag);
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // output_flag_present_flag
+  BitstreamAppend(bitstream, 3, 0);  // num_extra_slice_header_bits
+
+  BitstreamAppend(bitstream, 1,
+                  pic->pic_fields.bits.sign_data_hiding_enabled_flag);
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // cabac_init_present_flag
+
+  BitstreamAppendUE(bitstream, pic->num_ref_idx_l0_default_active_minus1);
+  BitstreamAppendUE(bitstream, pic->num_ref_idx_l1_default_active_minus1);
+  BitstreamAppendSE(bitstream, pic->pic_init_qp - 26);
+  BitstreamAppend(bitstream, 1,
+                  pic->pic_fields.bits.constrained_intra_pred_flag);
+  BitstreamAppend(bitstream, 1,
+                  pic->pic_fields.bits.transform_skip_enabled_flag);
+  BitstreamAppend(bitstream, 1, pic->pic_fields.bits.cu_qp_delta_enabled_flag);
+  if (pic->pic_fields.bits.cu_qp_delta_enabled_flag)
+    BitstreamAppendUE(bitstream, pic->diff_cu_qp_delta_depth);
+  BitstreamAppendSE(bitstream, pic->pps_cb_qp_offset);
+  BitstreamAppendSE(bitstream, pic->pps_cr_qp_offset);
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // pps_slice_chroma_qp_offsets_present_flag
+
+  BitstreamAppend(bitstream, 1, pic->pic_fields.bits.weighted_pred_flag);
+  BitstreamAppend(bitstream, 1, pic->pic_fields.bits.weighted_bipred_flag);
+  BitstreamAppend(bitstream, 1,
+                  pic->pic_fields.bits.transquant_bypass_enabled_flag);
+  BitstreamAppend(bitstream, 1, pic->pic_fields.bits.tiles_enabled_flag);
+  BitstreamAppend(bitstream, 1,
+                  pic->pic_fields.bits.entropy_coding_sync_enabled_flag);
+  if (pic->pic_fields.bits.tiles_enabled_flag) {
+    BitstreamAppendUE(bitstream, pic->num_tile_columns_minus1);
+    BitstreamAppendUE(bitstream, pic->num_tile_rows_minus1);
+    // TODO(mburakov): Implement this!!!
+    abort();
+  }
+  BitstreamAppend(
+      bitstream, 1,
+      pic->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag);
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // deblocking_filter_control_present_flag
+
+  BitstreamAppend(bitstream, 1,
+                  pic->pic_fields.bits.scaling_list_data_present_flag);
+  if (pic->pic_fields.bits.scaling_list_data_present_flag) {
+    // TODO(mburakov): Implement this!!!
+    abort();
+  }
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppend(bitstream, 1, 0);  // lists_modification_present_flag
+
+  BitstreamAppendUE(bitstream, pic->log2_parallel_merge_level_minus2);
+
+  // mburakov: ffmpeg defaults the parameters below.
+  BitstreamAppend(bitstream, 1,
+                  0);  // slice_segment_header_extension_present_flag
+  BitstreamAppend(bitstream, 1, 0);  // pps_extension_present_flag
+
+  // mburakov: Below is rbsp_trailing_bits structure.
+  BitstreamAppend(bitstream, 1, 1);  // rbsp_stop_one_bit
+  BitstreamByteAlign(bitstream);     // rbsp_alignment_zero_bit
+}
+
 static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
   for (;;) {
     ssize_t result = writev(fd, iovec, count);
@@ -990,6 +1075,7 @@ case PICTURE_TYPE_P:
 
   PackVpsRbsp(&bitstream, encode_context);
   PackSpsRbsp(&bitstream, encode_context);
+  PackPpsRbsp(&bitstream, encode_context);
 
   uint32_t total_size = (uint32_t)(bitstream.size / 8);
   struct iovec iovec[] = {
