@@ -31,4 +31,7 @@ void BitstreamAppendUE(struct Bitstream* bitstream, uint32_t bits);
 void BitstreamAppendSE(struct Bitstream* bitstream, int32_t bits);
 void BitstreamByteAlign(struct Bitstream* bitstream);
 
+void BitstreamInflate(struct Bitstream* bitstream,
+                      const struct Bitstream* source);
+
 #endif  // STREAMER_BITSTREAM_H_

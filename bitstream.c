@@ -57,3 +57,21 @@ void BitstreamByteAlign(struct Bitstream* bitstream) {
   *ptr &= ~0 << vacant_bits;
   bitstream->size += vacant_bits;
 }
+
+void BitstreamInflate(struct Bitstream* bitstream,
+                      const struct Bitstream* source) {
+  uint8_t* dst_data = (uint8_t*)bitstream->data + (bitstream->size + 7) / 8;
+  uint8_t* src_data = source->data;
+  size_t src_size = (source->size + 7) / 8;
+
+  if (src_size > 0) *dst_data++ = *src_data++;
+  if (src_size > 1) *dst_data++ = *src_data++;
+
+  for (size_t i = 2; i < src_size; i++) {
+    // mburakov: emulation_prevention_three_byte
+    if (!dst_data[-2] && !dst_data[-1] && !src_data[0]) *dst_data++ = 3;
+    *dst_data++ = *src_data++;
+  }
+
+  bitstream->size = (size_t)(dst_data - (uint8_t*)bitstream->data) * 8;
+}
