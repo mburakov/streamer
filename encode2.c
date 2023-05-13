@@ -32,14 +32,17 @@
 #include "gpu.h"
 #include "toolbox/utils.h"
 
-#define VPS_NUT 32
-#define SPS_NUT 33
-#define PPS_NUT 34
+#define HEVC_SLICE_TYPE_B 0
+#define HEVC_SLICE_TYPE_P 1
+#define HEVC_SLICE_TYPE_I 2
 
-#define HEVC_SLICE_P 1
-#define HEVC_SLICE_I 2
-
-#define HEVC_NAL_IDR_W_RADL 19
+#define HEVC_NUT_BLA_W_LP 16
+#define HEVC_NUT_IDR_W_RADL 19
+#define HEVC_NUT_IDR_N_LP 20
+#define HEVC_NUT_RSV_IRAP_VCL23 23
+#define HEVC_NUT_VPS 32
+#define HEVC_NUT_SPS 33
+#define HEVC_NUT_PPS 34
 
 struct EncodeContext {
   struct GpuContext* gpu_context;
@@ -390,8 +393,9 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
   }
 
   status = vaCreateContext(
-      encode_context->va_display, encode_context->va_config_id, (int)width,
-      (int)height, VA_PROGRESSIVE, NULL, 0, &encode_context->va_context_id);
+      encode_context->va_display, encode_context->va_config_id,
+      (int)(width_in_cb * min_cb_size), (int)(height_in_cb * min_cb_size),
+      VA_PROGRESSIVE, NULL, 0, &encode_context->va_context_id);
   if (status != VA_STATUS_SUCCESS) {
     LOG("Failed to create va context (%s)", VaErrorString(status));
     goto rollback_va_config_id;
@@ -491,280 +495,313 @@ static bool UploadMiscBuffer(const struct EncodeContext* encode_context,
                       stack_allocated_storage, presult);
 }
 
+static bool UploadPackedBuffer(const struct EncodeContext* encode_context,
+                               VAEncPackedHeaderType packed_header_type,
+                               unsigned int bit_length, void* data,
+                               VABufferID** presult) {
+  VAEncPackedHeaderParameterBuffer packed_header = {
+      .type = packed_header_type,
+      .bit_length = bit_length,
+      .has_emulation_bytes = 1,
+  };
+  return UploadBuffer(encode_context, VAEncPackedHeaderParameterBufferType,
+                      sizeof(packed_header), &packed_header, presult) &&
+         UploadBuffer(encode_context, VAEncPackedHeaderDataBufferType,
+                      (bit_length + 7) / 8, data, presult);
+}
+
 static void PackVpsRbsp(struct Bitstream* bitstream,
-                        const struct EncodeContext* encode_context) {
-  const VAEncSequenceParameterBufferHEVC* seq = &encode_context->seq;
+                        const VAEncSequenceParameterBufferHEVC* seq) {
+  char buffer[64];
+  struct Bitstream vps_rbsp = {
+      .data = buffer,
+      .size = 0,
+  };
 
   BitstreamAppend(bitstream, 32, 0x00000001);
   BitstreamAppend(bitstream, 1, 0);  // forbidden_zero_bit
-  BitstreamAppend(bitstream, 6, VPS_NUT);
+  BitstreamAppend(bitstream, 6, HEVC_NUT_VPS);
   BitstreamAppend(bitstream, 6, 0);  // nuh_layer_id
   BitstreamAppend(bitstream, 3, 1);  // nuh_temporal_id_plus1
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppend(bitstream, 4, 0);        // vps_video_parameter_set_id
-  BitstreamAppend(bitstream, 1, 1);        // vps_base_layer_internal_flag
-  BitstreamAppend(bitstream, 1, 1);        // vps_base_layer_available_flag
-  BitstreamAppend(bitstream, 6, 0);        // vps_max_layers_minus1
-  BitstreamAppend(bitstream, 3, 0);        // vps_max_sub_layers_minus1
-  BitstreamAppend(bitstream, 1, 1);        // vps_temporal_id_nesting_flag
-  BitstreamAppend(bitstream, 16, 0xffff);  // vps_reserved_0xffff_16bits
+  BitstreamAppend(&vps_rbsp, 4, 0);        // vps_video_parameter_set_id
+  BitstreamAppend(&vps_rbsp, 1, 1);        // vps_base_layer_internal_flag
+  BitstreamAppend(&vps_rbsp, 1, 1);        // vps_base_layer_available_flag
+  BitstreamAppend(&vps_rbsp, 6, 0);        // vps_max_layers_minus1
+  BitstreamAppend(&vps_rbsp, 3, 0);        // vps_max_sub_layers_minus1
+  BitstreamAppend(&vps_rbsp, 1, 1);        // vps_temporal_id_nesting_flag
+  BitstreamAppend(&vps_rbsp, 16, 0xffff);  // vps_reserved_0xffff_16bits
 
   // mburakov: Below is profile_tier_level structure.
-  BitstreamAppend(bitstream, 2, 0);  // general_profile_space
-  BitstreamAppend(bitstream, 1, seq->general_tier_flag);
-  BitstreamAppend(bitstream, 5, seq->general_profile_idc);
-  BitstreamAppend(bitstream, 32, 1 << (31 - seq->general_profile_idc));
+  BitstreamAppend(&vps_rbsp, 2, 0);  // general_profile_space
+  BitstreamAppend(&vps_rbsp, 1, seq->general_tier_flag);
+  BitstreamAppend(&vps_rbsp, 5, seq->general_profile_idc);
+  BitstreamAppend(&vps_rbsp, 32, 1 << (31 - seq->general_profile_idc));
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppend(bitstream, 1, 1);   // general_progressive_source_flag
-  BitstreamAppend(bitstream, 1, 0);   // general_interlaced_source_flag
-  BitstreamAppend(bitstream, 1, 1);   // general_non_packed_constraint_flag
-  BitstreamAppend(bitstream, 1, 1);   // general_frame_only_constraint_flag
-  BitstreamAppend(bitstream, 24, 0);  // general_reserved_zero_43bits
-  BitstreamAppend(bitstream, 19, 0);  // general_reserved_zero_43bits
-  BitstreamAppend(bitstream, 1, 0);   // general_inbld_flag (TODO)
+  BitstreamAppend(&vps_rbsp, 1, 1);   // general_progressive_source_flag
+  BitstreamAppend(&vps_rbsp, 1, 0);   // general_interlaced_source_flag
+  BitstreamAppend(&vps_rbsp, 1, 1);   // general_non_packed_constraint_flag
+  BitstreamAppend(&vps_rbsp, 1, 1);   // general_frame_only_constraint_flag
+  BitstreamAppend(&vps_rbsp, 24, 0);  // general_reserved_zero_43bits
+  BitstreamAppend(&vps_rbsp, 19, 0);  // general_reserved_zero_43bits
+  BitstreamAppend(&vps_rbsp, 1, 0);   // general_inbld_flag (TODO)
 
-  BitstreamAppend(bitstream, 8, seq->general_level_idc);
+  BitstreamAppend(&vps_rbsp, 8, seq->general_level_idc);
   // mburakov: Above is profile_tier_level structure.
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // vps_sub_layer_ordering_info_present_flag
+  BitstreamAppend(&vps_rbsp, 1, 0);  // vps_sub_layer_ordering_info_present_flag
 
   // mburakov: No B-frames.
-  BitstreamAppendUE(bitstream, 1);  // vps_max_dec_pic_buffering_minus1 (TODO)
-  BitstreamAppendUE(bitstream, 0);  // vps_max_num_reorder_pics
+  BitstreamAppendUE(&vps_rbsp, 1);  // vps_max_dec_pic_buffering_minus1 (TODO)
+  BitstreamAppendUE(&vps_rbsp, 0);  // vps_max_num_reorder_pics
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppendUE(bitstream, 0);   // vps_max_latency_increase_plus1
-  BitstreamAppend(bitstream, 6, 0);  // vps_max_layer_id
-  BitstreamAppendUE(bitstream, 0);   // vps_num_layer_sets_minus1
-  BitstreamAppend(bitstream, 1, 1);  // vps_timing_info_present_flag (TODO)
+  BitstreamAppendUE(&vps_rbsp, 0);   // vps_max_latency_increase_plus1
+  BitstreamAppend(&vps_rbsp, 6, 0);  // vps_max_layer_id
+  BitstreamAppendUE(&vps_rbsp, 0);   // vps_num_layer_sets_minus1
+  BitstreamAppend(&vps_rbsp, 1, 1);  // vps_timing_info_present_flag (TODO)
 
   // mburakov: 60 frames per second.
-  BitstreamAppend(bitstream, 32, 1);   // vps_num_units_in_tick
-  BitstreamAppend(bitstream, 32, 60);  // vps_time_scale
+  BitstreamAppend(&vps_rbsp, 32, 1);   // vps_num_units_in_tick
+  BitstreamAppend(&vps_rbsp, 32, 60);  // vps_time_scale
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // vps_poc_proportional_to_timing_flag
-  BitstreamAppendUE(bitstream, 0);   // vps_num_hrd_parameters
-  BitstreamAppend(bitstream, 1, 0);  // vps_extension_flag
+  BitstreamAppend(&vps_rbsp, 1, 0);  // vps_poc_proportional_to_timing_flag
+  BitstreamAppendUE(&vps_rbsp, 0);   // vps_num_hrd_parameters
+  BitstreamAppend(&vps_rbsp, 1, 0);  // vps_extension_flag
 
   // mburakov: Below is rbsp_trailing_bits structure.
-  BitstreamAppend(bitstream, 1, 1);  // rbsp_stop_one_bit
-  BitstreamByteAlign(bitstream);     // rbsp_alignment_zero_bit
+  BitstreamAppend(&vps_rbsp, 1, 1);  // rbsp_stop_one_bit
+  BitstreamByteAlign(&vps_rbsp);     // rbsp_alignment_zero_bit
+
+  BitstreamInflate(bitstream, &vps_rbsp);
 }
 
 static void PackSpsRbsp(struct Bitstream* bitstream,
-                        const struct EncodeContext* encode_context) {
-  const VAEncSequenceParameterBufferHEVC* seq = &encode_context->seq;
+                        const VAEncSequenceParameterBufferHEVC* seq,
+                        uint32_t crop_width, uint32_t crop_height) {
+  char buffer[64];
+  struct Bitstream sps_rbsp = {
+      .data = buffer,
+      .size = 0,
+  };
 
   BitstreamAppend(bitstream, 32, 0x00000001);
   BitstreamAppend(bitstream, 1, 0);  // forbidden_zero_bit
-  BitstreamAppend(bitstream, 6, SPS_NUT);
+  BitstreamAppend(bitstream, 6, HEVC_NUT_SPS);
   BitstreamAppend(bitstream, 6, 0);  // nuh_layer_id
   BitstreamAppend(bitstream, 3, 1);  // nuh_temporal_id_plus1
 
-  BitstreamAppend(bitstream, 4, 0);  // sps_video_parameter_set_id
-  BitstreamAppend(bitstream, 3, 0);  // sps_max_sub_layers_minus1
-  BitstreamAppend(bitstream, 1, 1);  // sps_temporal_id_nesting_flag
+  BitstreamAppend(&sps_rbsp, 4, 0);  // sps_video_parameter_set_id
+  BitstreamAppend(&sps_rbsp, 3, 0);  // sps_max_sub_layers_minus1
+  BitstreamAppend(&sps_rbsp, 1, 1);  // sps_temporal_id_nesting_flag
 
   // mburakov: Below is profile_tier_level structure.
-  BitstreamAppend(bitstream, 2, 0);  // general_profile_space
-  BitstreamAppend(bitstream, 1, seq->general_tier_flag);
-  BitstreamAppend(bitstream, 5, seq->general_profile_idc);
-  BitstreamAppend(bitstream, 32, 1 << (31 - seq->general_profile_idc));
+  BitstreamAppend(&sps_rbsp, 2, 0);  // general_profile_space
+  BitstreamAppend(&sps_rbsp, 1, seq->general_tier_flag);
+  BitstreamAppend(&sps_rbsp, 5, seq->general_profile_idc);
+  BitstreamAppend(&sps_rbsp, 32, 1 << (31 - seq->general_profile_idc));
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppend(bitstream, 1, 1);   // general_progressive_source_flag
-  BitstreamAppend(bitstream, 1, 0);   // general_interlaced_source_flag
-  BitstreamAppend(bitstream, 1, 1);   // general_non_packed_constraint_flag
-  BitstreamAppend(bitstream, 1, 1);   // general_frame_only_constraint_flag
-  BitstreamAppend(bitstream, 24, 0);  // general_reserved_zero_43bits
-  BitstreamAppend(bitstream, 19, 0);  // general_reserved_zero_43bits
-  BitstreamAppend(bitstream, 1, 0);   // general_inbld_flag (TODO)
+  BitstreamAppend(&sps_rbsp, 1, 1);   // general_progressive_source_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);   // general_interlaced_source_flag
+  BitstreamAppend(&sps_rbsp, 1, 1);   // general_non_packed_constraint_flag
+  BitstreamAppend(&sps_rbsp, 1, 1);   // general_frame_only_constraint_flag
+  BitstreamAppend(&sps_rbsp, 24, 0);  // general_reserved_zero_43bits
+  BitstreamAppend(&sps_rbsp, 19, 0);  // general_reserved_zero_43bits
+  BitstreamAppend(&sps_rbsp, 1, 0);   // general_inbld_flag (TODO)
 
-  BitstreamAppend(bitstream, 8, seq->general_level_idc);
+  BitstreamAppend(&sps_rbsp, 8, seq->general_level_idc);
   // mburakov: Above is profile_tier_level structure.
 
-  BitstreamAppendUE(bitstream, 0);  // sps_seq_parameter_set_id
-  BitstreamAppendUE(bitstream, seq->seq_fields.bits.chroma_format_idc);
-  BitstreamAppendUE(bitstream, seq->pic_width_in_luma_samples);
-  BitstreamAppendUE(bitstream, seq->pic_height_in_luma_samples);
-  if (encode_context->width != seq->pic_width_in_luma_samples ||
-      encode_context->height != seq->pic_height_in_luma_samples) {
+  BitstreamAppendUE(&sps_rbsp, 0);  // sps_seq_parameter_set_id
+  BitstreamAppendUE(&sps_rbsp, seq->seq_fields.bits.chroma_format_idc);
+  BitstreamAppendUE(&sps_rbsp, seq->pic_width_in_luma_samples);
+  BitstreamAppendUE(&sps_rbsp, seq->pic_height_in_luma_samples);
+  if (crop_width != seq->pic_width_in_luma_samples ||
+      crop_height != seq->pic_height_in_luma_samples) {
     uint32_t crop_win_right_offset_in_chroma_samples =
-        (seq->pic_width_in_luma_samples - encode_context->width) / 2;
+        (seq->pic_width_in_luma_samples - crop_width) / 2;
     uint32_t crop_win_bottom_offset_in_chroma_samples =
-        (seq->pic_height_in_luma_samples - encode_context->height) / 2;
-    BitstreamAppend(bitstream, 1, 1);  // conformance_window_flag
-    BitstreamAppendUE(bitstream, 0);   // conf_win_left_offset
-    BitstreamAppendUE(bitstream, crop_win_right_offset_in_chroma_samples);
-    BitstreamAppendUE(bitstream, 0);  // conf_win_top_offset
-    BitstreamAppendUE(bitstream, crop_win_bottom_offset_in_chroma_samples);
+        (seq->pic_height_in_luma_samples - crop_height) / 2;
+    BitstreamAppend(&sps_rbsp, 1, 1);  // conformance_window_flag
+    BitstreamAppendUE(&sps_rbsp, 0);   // conf_win_left_offset
+    BitstreamAppendUE(&sps_rbsp, crop_win_right_offset_in_chroma_samples);
+    BitstreamAppendUE(&sps_rbsp, 0);  // conf_win_top_offset
+    BitstreamAppendUE(&sps_rbsp, crop_win_bottom_offset_in_chroma_samples);
   } else {
-    BitstreamAppend(bitstream, 1, 0);  // conformance_window_flag
+    BitstreamAppend(&sps_rbsp, 1, 0);  // conformance_window_flag
   }
-  BitstreamAppendUE(bitstream, seq->seq_fields.bits.bit_depth_luma_minus8);
-  BitstreamAppendUE(bitstream, seq->seq_fields.bits.bit_depth_chroma_minus8);
+
+  BitstreamAppendUE(&sps_rbsp, seq->seq_fields.bits.bit_depth_luma_minus8);
+  BitstreamAppendUE(&sps_rbsp, seq->seq_fields.bits.bit_depth_chroma_minus8);
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppendUE(bitstream, 8);   // log2_max_pic_order_cnt_lsb_minus4
-  BitstreamAppend(bitstream, 1, 0);  // sps_sub_layer_ordering_info_present_flag
+  BitstreamAppendUE(&sps_rbsp, 8);   // log2_max_pic_order_cnt_lsb_minus4
+  BitstreamAppend(&sps_rbsp, 1, 0);  // sps_sub_layer_ordering_info_present_flag
 
   // mburakov: No B-frames.
-  BitstreamAppendUE(bitstream, 1);  // sps_max_dec_pic_buffering_minus1 (TODO)
-  BitstreamAppendUE(bitstream, 0);  // sps_max_num_reorder_pics
+  BitstreamAppendUE(&sps_rbsp, 1);  // sps_max_dec_pic_buffering_minus1 (TODO)
+  BitstreamAppendUE(&sps_rbsp, 0);  // sps_max_num_reorder_pics
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppendUE(bitstream, 0);  // sps_max_latency_increase_plus1
+  BitstreamAppendUE(&sps_rbsp, 0);  // sps_max_latency_increase_plus1
 
-  BitstreamAppendUE(bitstream, seq->log2_min_luma_coding_block_size_minus3);
-  BitstreamAppendUE(bitstream, seq->log2_diff_max_min_luma_coding_block_size);
-  BitstreamAppendUE(bitstream, seq->log2_min_transform_block_size_minus2);
-  BitstreamAppendUE(bitstream, seq->log2_diff_max_min_transform_block_size);
-  BitstreamAppendUE(bitstream, seq->max_transform_hierarchy_depth_inter);
-  BitstreamAppendUE(bitstream, seq->max_transform_hierarchy_depth_intra);
-  BitstreamAppend(bitstream, 1, seq->seq_fields.bits.scaling_list_enabled_flag);
+  BitstreamAppendUE(&sps_rbsp, seq->log2_min_luma_coding_block_size_minus3);
+  BitstreamAppendUE(&sps_rbsp, seq->log2_diff_max_min_luma_coding_block_size);
+  BitstreamAppendUE(&sps_rbsp, seq->log2_min_transform_block_size_minus2);
+  BitstreamAppendUE(&sps_rbsp, seq->log2_diff_max_min_transform_block_size);
+  BitstreamAppendUE(&sps_rbsp, seq->max_transform_hierarchy_depth_inter);
+  BitstreamAppendUE(&sps_rbsp, seq->max_transform_hierarchy_depth_intra);
+  BitstreamAppend(&sps_rbsp, 1, seq->seq_fields.bits.scaling_list_enabled_flag);
   // mburakov: scaling list details are absent because scaling_list_enabled_flag
   // is hardcoded to zero during sps initialization.
-  BitstreamAppend(bitstream, 1, seq->seq_fields.bits.amp_enabled_flag);
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&sps_rbsp, 1, seq->seq_fields.bits.amp_enabled_flag);
+  BitstreamAppend(&sps_rbsp, 1,
                   seq->seq_fields.bits.sample_adaptive_offset_enabled_flag);
-  BitstreamAppend(bitstream, 1, seq->seq_fields.bits.pcm_enabled_flag);
+  BitstreamAppend(&sps_rbsp, 1, seq->seq_fields.bits.pcm_enabled_flag);
   // mburakov: pcm sample details are missing because pcm_enabled_flag is
   // hardcoded to zero during sps initialization.
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppendUE(bitstream, 0);   // num_short_term_ref_pic_sets
-  BitstreamAppend(bitstream, 1, 0);  // long_term_ref_pics_present_flag
+  BitstreamAppendUE(&sps_rbsp, 0);   // num_short_term_ref_pic_sets
+  BitstreamAppend(&sps_rbsp, 1, 0);  // long_term_ref_pics_present_flag
 
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&sps_rbsp, 1,
                   seq->seq_fields.bits.sps_temporal_mvp_enabled_flag);
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&sps_rbsp, 1,
                   seq->seq_fields.bits.strong_intra_smoothing_enabled_flag);
   // TODO(mburakov): ffmpeg hardcodes vui_parameters_present_flag to zero for
   // unpacked sps, but to one for packed sps. Why???
-  BitstreamAppend(bitstream, 1, 1);  // vui_parameters_present_flag
+  BitstreamAppend(&sps_rbsp, 1, 1);  // vui_parameters_present_flag
 
   // mburakov: Below is vui_parameters structure.
-  BitstreamAppend(bitstream, 1, 0);  // aspect_ratio_info_present_flag
-  BitstreamAppend(bitstream, 1, 0);  // overscan_info_present_flag
-  BitstreamAppend(bitstream, 1, 1);  // video_signal_type_present_flag
-  BitstreamAppend(bitstream, 3, 5);  // video_format
-  BitstreamAppend(bitstream, 1, 0);  // video_full_range_flag (TODO)
-  BitstreamAppend(bitstream, 1, 1);  // colour_description_present_flag
-  BitstreamAppend(bitstream, 8, 2);  // colour_primaries (TODO)
-  BitstreamAppend(bitstream, 8, 2);  // transfer_characteristics (TODO)
-  BitstreamAppend(bitstream, 8, 6);  // matrix_coeffs (TODO)
-  BitstreamAppend(bitstream, 1, 0);  // chroma_loc_info_present_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // aspect_ratio_info_present_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // overscan_info_present_flag
+  BitstreamAppend(&sps_rbsp, 1, 1);  // video_signal_type_present_flag
+  BitstreamAppend(&sps_rbsp, 3, 5);  // video_format
+  BitstreamAppend(&sps_rbsp, 1, 0);  // video_full_range_flag (TODO)
+  BitstreamAppend(&sps_rbsp, 1, 1);  // colour_description_present_flag
+  BitstreamAppend(&sps_rbsp, 8, 2);  // colour_primaries (TODO)
+  BitstreamAppend(&sps_rbsp, 8, 2);  // transfer_characteristics (TODO)
+  BitstreamAppend(&sps_rbsp, 8, 6);  // matrix_coeffs (TODO)
+  BitstreamAppend(&sps_rbsp, 1, 0);  // chroma_loc_info_present_flag
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // neutral_chroma_indication_flag
-  BitstreamAppend(bitstream, 1, 0);  // field_seq_flag
-  BitstreamAppend(bitstream, 1, 0);  // frame_field_info_present_flag
-  BitstreamAppend(bitstream, 1, 0);  // default_display_window_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // neutral_chroma_indication_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // field_seq_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // frame_field_info_present_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // default_display_window_flag
 
-  BitstreamAppend(bitstream, 1, 1);  // vui_timing_info_present_flag (TODO)
+  BitstreamAppend(&sps_rbsp, 1, 1);  // vui_timing_info_present_flag (TODO)
 
   // mburakov: 60 frames per second.
-  BitstreamAppend(bitstream, 32, 1);   // vui_num_units_in_tick
-  BitstreamAppend(bitstream, 32, 60);  // vui_time_scale
+  BitstreamAppend(&sps_rbsp, 32, 1);   // vui_num_units_in_tick
+  BitstreamAppend(&sps_rbsp, 32, 60);  // vui_time_scale
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // vui_poc_proportional_to_timing_flag
-  BitstreamAppend(bitstream, 1, 0);  // vui_hrd_parameters_present_flag
-  BitstreamAppend(bitstream, 1, 1);  // bitstream_restriction_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // vui_poc_proportional_to_timing_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // vui_hrd_parameters_present_flag
+  BitstreamAppend(&sps_rbsp, 1, 1);  // bitstream_restriction_flag
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // tiles_fixed_structure_flag
+  BitstreamAppend(&sps_rbsp, 1, 0);  // tiles_fixed_structure_flag
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppend(bitstream, 1, 1);  // motion_vectors_over_pic_boundaries_flag
-  BitstreamAppend(bitstream, 1, 1);  // restricted_ref_pic_lists_flag
+  BitstreamAppend(&sps_rbsp, 1, 1);  // motion_vectors_over_pic_boundaries_flag
+  BitstreamAppend(&sps_rbsp, 1, 1);  // restricted_ref_pic_lists_flag
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppendUE(bitstream, 0);  // min_spatial_segmentation_idc
+  BitstreamAppendUE(&sps_rbsp, 0);  // min_spatial_segmentation_idc
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppendUE(bitstream, 0);   // max_bytes_per_pic_denom
-  BitstreamAppendUE(bitstream, 0);   // max_bits_per_min_cu_denom
-  BitstreamAppendUE(bitstream, 15);  // log2_max_mv_length_horizontal
-  BitstreamAppendUE(bitstream, 15);  // log2_max_mv_length_vertical
+  BitstreamAppendUE(&sps_rbsp, 0);   // max_bytes_per_pic_denom
+  BitstreamAppendUE(&sps_rbsp, 0);   // max_bits_per_min_cu_denom
+  BitstreamAppendUE(&sps_rbsp, 15);  // log2_max_mv_length_horizontal
+  BitstreamAppendUE(&sps_rbsp, 15);  // log2_max_mv_length_vertical
   // mburakov: Above is vui_parameters structure.
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // sps_extension_present_flag (TODO)
+  BitstreamAppend(&sps_rbsp, 1, 0);  // sps_extension_present_flag (TODO)
 
   // mburakov: Below is rbsp_trailing_bits structure.
-  BitstreamAppend(bitstream, 1, 1);  // rbsp_stop_one_bit
-  BitstreamByteAlign(bitstream);     // rbsp_alignment_zero_bit
+  BitstreamAppend(&sps_rbsp, 1, 1);  // rbsp_stop_one_bit
+  BitstreamByteAlign(&sps_rbsp);     // rbsp_alignment_zero_bit
+
+  BitstreamInflate(bitstream, &sps_rbsp);
 }
 
 static void PackPpsRbsp(struct Bitstream* bitstream,
-                        const struct EncodeContext* encode_context) {
-  const VAEncPictureParameterBufferHEVC* pic = &encode_context->pic;
+                        const VAEncPictureParameterBufferHEVC* pic) {
+  char buffer[64];
+  struct Bitstream pps_rbsp = {
+      .data = buffer,
+      .size = 0,
+  };
 
   BitstreamAppend(bitstream, 32, 0x00000001);
   BitstreamAppend(bitstream, 1, 0);  // forbidden_zero_bit
-  BitstreamAppend(bitstream, 6, PPS_NUT);
+  BitstreamAppend(bitstream, 6, HEVC_NUT_PPS);
   BitstreamAppend(bitstream, 6, 0);  // nuh_layer_id
   BitstreamAppend(bitstream, 3, 1);  // nuh_temporal_id_plus1
 
   // mburakov: ffmpeg hardcodes the parameters below.
-  BitstreamAppendUE(bitstream, 0);  // pps_pic_parameter_set_id
-  BitstreamAppendUE(bitstream, 0);  // pps_seq_parameter_set_id (TODO)
+  BitstreamAppendUE(&pps_rbsp, 0);  // pps_pic_parameter_set_id
+  BitstreamAppendUE(&pps_rbsp, 0);  // pps_seq_parameter_set_id (TODO)
 
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&pps_rbsp, 1,
                   pic->pic_fields.bits.dependent_slice_segments_enabled_flag);
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // output_flag_present_flag
-  BitstreamAppend(bitstream, 3, 0);  // num_extra_slice_header_bits
+  BitstreamAppend(&pps_rbsp, 1, 0);  // output_flag_present_flag
+  BitstreamAppend(&pps_rbsp, 3, 0);  // num_extra_slice_header_bits
 
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&pps_rbsp, 1,
                   pic->pic_fields.bits.sign_data_hiding_enabled_flag);
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // cabac_init_present_flag
+  BitstreamAppend(&pps_rbsp, 1, 0);  // cabac_init_present_flag
 
-  BitstreamAppendUE(bitstream, pic->num_ref_idx_l0_default_active_minus1);
-  BitstreamAppendUE(bitstream, pic->num_ref_idx_l1_default_active_minus1);
-  BitstreamAppendSE(bitstream, pic->pic_init_qp - 26);
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppendUE(&pps_rbsp, pic->num_ref_idx_l0_default_active_minus1);
+  BitstreamAppendUE(&pps_rbsp, pic->num_ref_idx_l1_default_active_minus1);
+  BitstreamAppendSE(&pps_rbsp, pic->pic_init_qp - 26);
+  BitstreamAppend(&pps_rbsp, 1,
                   pic->pic_fields.bits.constrained_intra_pred_flag);
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&pps_rbsp, 1,
                   pic->pic_fields.bits.transform_skip_enabled_flag);
-  BitstreamAppend(bitstream, 1, pic->pic_fields.bits.cu_qp_delta_enabled_flag);
+  BitstreamAppend(&pps_rbsp, 1, pic->pic_fields.bits.cu_qp_delta_enabled_flag);
   if (pic->pic_fields.bits.cu_qp_delta_enabled_flag)
-    BitstreamAppendUE(bitstream, pic->diff_cu_qp_delta_depth);
-  BitstreamAppendSE(bitstream, pic->pps_cb_qp_offset);
-  BitstreamAppendSE(bitstream, pic->pps_cr_qp_offset);
+    BitstreamAppendUE(&pps_rbsp, pic->diff_cu_qp_delta_depth);
+  BitstreamAppendSE(&pps_rbsp, pic->pps_cb_qp_offset);
+  BitstreamAppendSE(&pps_rbsp, pic->pps_cr_qp_offset);
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // pps_slice_chroma_qp_offsets_present_flag
+  BitstreamAppend(&pps_rbsp, 1, 0);  // pps_slice_chroma_qp_offsets_present_flag
 
-  BitstreamAppend(bitstream, 1, pic->pic_fields.bits.weighted_pred_flag);
-  BitstreamAppend(bitstream, 1, pic->pic_fields.bits.weighted_bipred_flag);
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&pps_rbsp, 1, pic->pic_fields.bits.weighted_pred_flag);
+  BitstreamAppend(&pps_rbsp, 1, pic->pic_fields.bits.weighted_bipred_flag);
+  BitstreamAppend(&pps_rbsp, 1,
                   pic->pic_fields.bits.transquant_bypass_enabled_flag);
-  BitstreamAppend(bitstream, 1, pic->pic_fields.bits.tiles_enabled_flag);
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&pps_rbsp, 1, pic->pic_fields.bits.tiles_enabled_flag);
+  BitstreamAppend(&pps_rbsp, 1,
                   pic->pic_fields.bits.entropy_coding_sync_enabled_flag);
   if (pic->pic_fields.bits.tiles_enabled_flag) {
-    BitstreamAppendUE(bitstream, pic->num_tile_columns_minus1);
-    BitstreamAppendUE(bitstream, pic->num_tile_rows_minus1);
+    BitstreamAppendUE(&pps_rbsp, pic->num_tile_columns_minus1);
+    BitstreamAppendUE(&pps_rbsp, pic->num_tile_rows_minus1);
     // TODO(mburakov): Implement this!!!
     abort();
   }
   BitstreamAppend(
-      bitstream, 1,
+      &pps_rbsp, 1,
       pic->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag);
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // deblocking_filter_control_present_flag
+  BitstreamAppend(&pps_rbsp, 1, 0);  // deblocking_filter_control_present_flag
 
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&pps_rbsp, 1,
                   pic->pic_fields.bits.scaling_list_data_present_flag);
   if (pic->pic_fields.bits.scaling_list_data_present_flag) {
     // TODO(mburakov): Implement this!!!
@@ -772,18 +809,214 @@ static void PackPpsRbsp(struct Bitstream* bitstream,
   }
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppend(bitstream, 1, 0);  // lists_modification_present_flag
+  BitstreamAppend(&pps_rbsp, 1, 0);  // lists_modification_present_flag
 
-  BitstreamAppendUE(bitstream, pic->log2_parallel_merge_level_minus2);
+  BitstreamAppendUE(&pps_rbsp, pic->log2_parallel_merge_level_minus2);
 
   // mburakov: ffmpeg defaults the parameters below.
-  BitstreamAppend(bitstream, 1,
+  BitstreamAppend(&pps_rbsp, 1,
                   0);  // slice_segment_header_extension_present_flag
-  BitstreamAppend(bitstream, 1, 0);  // pps_extension_present_flag
+  BitstreamAppend(&pps_rbsp, 1, 0);  // pps_extension_present_flag
 
   // mburakov: Below is rbsp_trailing_bits structure.
-  BitstreamAppend(bitstream, 1, 1);  // rbsp_stop_one_bit
-  BitstreamByteAlign(bitstream);     // rbsp_alignment_zero_bit
+  BitstreamAppend(&pps_rbsp, 1, 1);  // rbsp_stop_one_bit
+  BitstreamByteAlign(&pps_rbsp);     // rbsp_alignment_zero_bit
+
+  BitstreamInflate(bitstream, &pps_rbsp);
+}
+
+static void PackSliceSegmentHeaderRbsp(
+    struct Bitstream* bitstream, const VAEncSequenceParameterBufferHEVC* seq,
+    const VAEncPictureParameterBufferHEVC* pic,
+    const VAEncSliceParameterBufferHEVC* slice) {
+  BitstreamAppend(bitstream, 32, 0x00000001);
+  BitstreamAppend(bitstream, 1, 0);  // forbidden_zero_bit
+  BitstreamAppend(bitstream, 6, pic->nal_unit_type);
+  BitstreamAppend(bitstream, 6, 0);  // nuh_layer_id
+  BitstreamAppend(bitstream, 3, 1);  // nuh_temporal_id_plus1
+
+  // TODO(mburakov): I have no idea what I'm doing...
+  static const uint32_t first_slice_segment_in_pic_flag = 1;
+
+  // mburakov: ffmpeg defaults the parameteres below.
+  static const uint32_t num_extra_slice_header_bits = 0;
+  static const uint32_t output_flag_present_flag = 0;
+  static const uint32_t lists_modification_present_flag = 0;
+  static const uint32_t cabac_init_present_flag = 0;
+  static const uint32_t motion_vector_resolution_control_idc = 0;
+  static const uint32_t pps_slice_chroma_qp_offsets_present_flag = 0;
+  static const uint32_t pps_slice_act_qp_offsets_present_flag = 0;
+  static const uint32_t chroma_qp_offset_list_enabled_flag = 0;
+  static const uint32_t deblocking_filter_override_enabled_flag = 0;
+  static const uint32_t deblocking_filter_override_flag = 0;
+  static const uint32_t num_entry_point_offsets = 0;
+  static const uint32_t slice_segment_header_extension_present_flag = 0;
+
+  // mburakov: ffmpeg hardcodes the parameters below.
+  static const uint32_t log2_max_pic_order_cnt_lsb_minus4 = 8;
+  static const uint32_t short_term_ref_pic_set_sps_flag = 0;
+  static const uint32_t num_short_term_ref_pic_sets = 0;
+  static const uint32_t long_term_ref_pics_present_flag = 0;
+
+  BitstreamAppend(bitstream, 1, first_slice_segment_in_pic_flag);
+  if (pic->nal_unit_type >= HEVC_NUT_BLA_W_LP &&
+      pic->nal_unit_type <= HEVC_NUT_RSV_IRAP_VCL23) {
+    BitstreamAppend(bitstream, 1,
+                    pic->pic_fields.bits.no_output_of_prior_pics_flag);
+  }
+  BitstreamAppendUE(bitstream, slice->slice_pic_parameter_set_id);
+  if (!first_slice_segment_in_pic_flag) {
+    if (pic->pic_fields.bits.dependent_slice_segments_enabled_flag) {
+      BitstreamAppend(bitstream, 1,
+                      slice->slice_fields.bits.dependent_slice_segment_flag);
+    }
+    // TODO(mburakov): Implement this!!!
+    abort();
+  }
+
+  if (!slice->slice_fields.bits.dependent_slice_segment_flag) {
+    for (uint32_t i = 0; i < num_extra_slice_header_bits; i++) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+    BitstreamAppendUE(bitstream, slice->slice_type);
+    if (output_flag_present_flag) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+    if (seq->seq_fields.bits.separate_colour_plane_flag) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+    if (pic->nal_unit_type != HEVC_NUT_IDR_W_RADL &&
+        pic->nal_unit_type != HEVC_NUT_IDR_N_LP) {
+      uint32_t slice_pic_order_cnt_lsb =
+          pic->decoded_curr_pic.pic_order_cnt &
+          (1 << (log2_max_pic_order_cnt_lsb_minus4 + 4)) - 1;
+      BitstreamAppend(bitstream, log2_max_pic_order_cnt_lsb_minus4 + 4,
+                      slice_pic_order_cnt_lsb);
+      BitstreamAppend(bitstream, 1, short_term_ref_pic_set_sps_flag);
+      if (!short_term_ref_pic_set_sps_flag) {
+        // TODO(mburakov): Implement this!!!
+        abort();
+      } else if (num_short_term_ref_pic_sets > 0) {
+        // TODO(mburakov): Implement this!!!
+        abort();
+      }
+      if (long_term_ref_pics_present_flag) {
+        // TODO(mburakov): Implement this!!!
+        abort();
+      }
+      if (seq->seq_fields.bits.sps_temporal_mvp_enabled_flag) {
+        BitstreamAppend(
+            bitstream, 1,
+            slice->slice_fields.bits.slice_temporal_mvp_enabled_flag);
+      }
+    }
+    if (seq->seq_fields.bits.sample_adaptive_offset_enabled_flag) {
+      BitstreamAppend(bitstream, 1,
+                      slice->slice_fields.bits.slice_sao_luma_flag);
+      uint32_t ChromaArrayType =
+          !seq->seq_fields.bits.separate_colour_plane_flag
+              ? seq->seq_fields.bits.chroma_format_idc
+              : 0;
+      if (ChromaArrayType != 0) {
+        BitstreamAppend(bitstream, 1,
+                        slice->slice_fields.bits.slice_sao_chroma_flag);
+      }
+    }
+    if (slice->slice_type == HEVC_SLICE_TYPE_P ||
+        slice->slice_type == HEVC_SLICE_TYPE_B) {
+      BitstreamAppend(
+          bitstream, 1,
+          slice->slice_fields.bits.num_ref_idx_active_override_flag);
+      if (slice->slice_fields.bits.num_ref_idx_active_override_flag) {
+        BitstreamAppendUE(bitstream, slice->num_ref_idx_l0_active_minus1);
+        if (slice->slice_type == HEVC_SLICE_TYPE_B)
+          BitstreamAppendUE(bitstream, slice->num_ref_idx_l1_active_minus1);
+      }
+      if (lists_modification_present_flag /* && NumPicTotalCurr > 1*/) {
+        // TODO(mburakov): Implement this!!!
+        abort();
+      }
+      if (slice->slice_type == HEVC_SLICE_TYPE_B) {
+        BitstreamAppend(bitstream, 1,
+                        slice->slice_fields.bits.mvd_l1_zero_flag);
+      }
+      if (cabac_init_present_flag) {
+        BitstreamAppend(bitstream, 1, slice->slice_fields.bits.cabac_init_flag);
+      }
+      if (slice->slice_fields.bits.slice_temporal_mvp_enabled_flag) {
+        if (slice->slice_type == HEVC_SLICE_TYPE_B) {
+          BitstreamAppend(bitstream, 1,
+                          slice->slice_fields.bits.collocated_from_l0_flag);
+        }
+        if ((slice->slice_fields.bits.collocated_from_l0_flag &&
+             slice->num_ref_idx_l0_active_minus1 > 0) ||
+            (!slice->slice_fields.bits.collocated_from_l0_flag &&
+             slice->num_ref_idx_l1_active_minus1 > 0)) {
+          BitstreamAppendUE(bitstream, pic->collocated_ref_pic_index);
+        }
+      }
+      if ((pic->pic_fields.bits.weighted_pred_flag &&
+           slice->slice_type == HEVC_SLICE_TYPE_P) ||
+          (pic->pic_fields.bits.weighted_bipred_flag &&
+           slice->slice_type == HEVC_SLICE_TYPE_B)) {
+        // TODO(mburakov): Implement this!!!
+        abort();
+      }
+      BitstreamAppendUE(bitstream, 5 - slice->max_num_merge_cand);
+      if (motion_vector_resolution_control_idc == 2) {
+        // TODO(mburakov): Implement this!!!
+        abort();
+      }
+    }
+    BitstreamAppendSE(bitstream, slice->slice_qp_delta);
+    if (pps_slice_chroma_qp_offsets_present_flag) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+    if (pps_slice_act_qp_offsets_present_flag) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+    if (chroma_qp_offset_list_enabled_flag) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+    if (deblocking_filter_override_enabled_flag) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+    if (deblocking_filter_override_flag) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+    if (pic->pic_fields.bits.pps_loop_filter_across_slices_enabled_flag &&
+        (slice->slice_fields.bits.slice_sao_luma_flag ||
+         slice->slice_fields.bits.slice_sao_chroma_flag ||
+         !slice->slice_fields.bits.slice_deblocking_filter_disabled_flag)) {
+      BitstreamAppend(bitstream, 1,
+                      slice->slice_fields.bits
+                          .slice_loop_filter_across_slices_enabled_flag);
+    }
+  }
+  if (pic->pic_fields.bits.tiles_enabled_flag ||
+      pic->pic_fields.bits.entropy_coding_sync_enabled_flag) {
+    BitstreamAppendUE(bitstream, num_entry_point_offsets);
+    if (num_entry_point_offsets > 0) {
+      // TODO(mburakov): Implement this!!!
+      abort();
+    }
+  }
+  if (slice_segment_header_extension_present_flag) {
+    // TODO(mburakov): Implement this!!!
+    abort();
+  }
+
+  // mburakov: Below is byte_alignment structure.
+  BitstreamAppend(bitstream, 1, 1);  // alignment_bit_equal_to_one
+  BitstreamByteAlign(bitstream);     // alignment_bit_equal_to_zero
 }
 
 static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
@@ -805,7 +1038,7 @@ static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
 }
 
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
-  VABufferID buffers[8];
+  VABufferID buffers[12];
   VABufferID* buffer_ptr = buffers;
   if (!UploadBuffer(encode_context, VAEncSequenceParameterBufferType,
                     sizeof(encode_context->seq), &encode_context->seq,
@@ -844,7 +1077,7 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     };
   }
   encode_context->pic.coded_buf = encode_context->output_buffer_id;
-  encode_context->pic.nal_unit_type = HEVC_NAL_IDR_W_RADL;
+  encode_context->pic.nal_unit_type = HEVC_NUT_IDR_W_RADL;
   encode_context->pic.pic_fields.bits.idr_pic_flag = 1;
   encode_context->pic.pic_fields.bits.coding_type = 1;
   encode_context->pic.pic_fields.bits.reference_pic_flag = 1;
@@ -855,20 +1088,39 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     goto rollback_buffers;
   }
 
-  // VAEncSequenceParameterBufferType
+  if (idr) {
+    char buffer[256];
+    struct Bitstream bitstream = {
+        .data = buffer,
+        .size = 0,
+    };
+    PackVpsRbsp(&bitstream, &encode_context->seq);
+    PackSpsRbsp(&bitstream, &encode_context->seq, encode_context->width,
+                encode_context->height);
+    PackPpsRbsp(&bitstream, &encode_context->pic);
+    if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSequence,
+                            (unsigned int)bitstream.size, bitstream.data,
+                            &buffer_ptr)) {
+      LOG("Failed to upload packed sequence header");
+      goto rollback_buffers;
+    }
+  }
+
   // if (IDR) {
-  //   VAEncMiscParameterTypeRateControl
-  //   VAEncMiscParameterTypeFrameRate
+  //   VAEncSequenceParameterBufferType
+  // }
+  // if (IDR) {
+  //   VAEncMiscParameterBufferType (VAEncMiscParameterTypeRateControl)
+  //   VAEncMiscParameterBufferType (VAEncMiscParameterTypeFrameRate)
   // }
   // VAEncPictureParameterBufferType
   // if (IDR) {
-  //   Packed VPS
-  //   Packed SPS
-  //   Packed PPS
-  //   Packed AU
+  //   VAEncPackedHeaderParameterBufferType (VAEncPackedHeaderSequence)
+  //   VAEncPackedHeaderDataBufferType (VPS+SPS+PPS)
   // }
-  // VAEncSliceParameterBufferHEVC
-  // Packed slice header
+  // VAEncPackedHeaderParameterBufferType (VAEncPackedHeaderSlice)
+  // VAEncPackedHeaderDataBufferType (slice header)
+  // VAEncSliceParameterBufferType
 
 #if 0
 if (pic->type == PICTURE_TYPE_IDR) {
@@ -972,7 +1224,7 @@ case PICTURE_TYPE_P:
       .slice_segment_address = 0,  // calculated
       .num_ctu_in_slice = block_size,
 
-      .slice_type = HEVC_SLICE_I,  // calculated
+      .slice_type = HEVC_SLICE_TYPE_I,  // calculated
       .slice_pic_parameter_set_id =
           encode_context->pic.slice_pic_parameter_set_id,
 
@@ -1037,6 +1289,20 @@ case PICTURE_TYPE_P:
 
   // TODO(mburakov): ffmpeg assign reference frame for non-I-frames here.
 
+  char buffer[256];
+  struct Bitstream bitstream = {
+      .data = buffer,
+      .size = 0,
+  };
+  PackSliceSegmentHeaderRbsp(&bitstream, &encode_context->seq,
+                             &encode_context->pic, &slice);
+  if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSlice,
+                          (unsigned int)bitstream.size, bitstream.data,
+                          &buffer_ptr)) {
+    LOG("Failed to upload packed sequence header");
+    goto rollback_buffers;
+  }
+
   if (!UploadBuffer(encode_context, VAEncSliceParameterBufferType,
                     sizeof(slice), &slice, &buffer_ptr)) {
     LOG("Failed to upload slice parameter buffer");
@@ -1065,30 +1331,36 @@ case PICTURE_TYPE_P:
     LOG("Failed to end va picture (%s)", VaErrorString(status));
     goto rollback_buffers;
   }
-  LOG("GOT FRAME!");
 
-  char buffer[256];
-  struct Bitstream bitstream = {
-      .data = buffer,
-      .size = 0,
-  };
-
-  PackVpsRbsp(&bitstream, encode_context);
-  PackSpsRbsp(&bitstream, encode_context);
-  PackPpsRbsp(&bitstream, encode_context);
-
-  uint32_t total_size = (uint32_t)(bitstream.size / 8);
-  struct iovec iovec[] = {
-      {.iov_base = &total_size, .iov_len = sizeof(total_size)},
-      {.iov_base = bitstream.data, .iov_len = total_size},
-  };
-  if (!DrainBuffers(fd, iovec, LENGTH(iovec))) {
-    LOG("Failed to drain encoded frame");
+  status = vaSyncBuffer(encode_context->va_display,
+                        encode_context->output_buffer_id, VA_TIMEOUT_INFINITE);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to sync va buffer (%s)", VaErrorString(status));
     goto rollback_buffers;
   }
 
+  VACodedBufferSegment* segment;
+  status = vaMapBuffer(encode_context->va_display,
+                       encode_context->output_buffer_id, (void**)&segment);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to map va buffer (%s)", VaErrorString(status));
+    goto rollback_buffers;
+  }
+
+  struct iovec iovec[] = {
+      {.iov_base = &segment->size, .iov_len = sizeof(segment->size)},
+      {.iov_base = segment->buf, .iov_len = segment->size},
+  };
+  if (!DrainBuffers(fd, iovec, LENGTH(iovec))) {
+    LOG("Failed to drain encoded frame");
+    goto rollback_segment;
+  }
+
+  LOG("GOT FRAME!");
   result = false;
 
+rollback_segment:
+  vaUnmapBuffer(encode_context->va_display, encode_context->output_buffer_id);
 rollback_buffers:
   while (buffer_ptr-- > buffers)
     vaDestroyBuffer(encode_context->va_display, *buffer_ptr);
