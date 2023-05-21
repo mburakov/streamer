@@ -50,8 +50,10 @@ struct EncodeContext {
   VASurfaceID input_surface_id;
   struct GpuFrame* gpu_frame;
 
-  VASurfaceID recon_surface_ids[4];
+  VASurfaceID recon_surface_ids[2];
   VABufferID output_buffer_id;
+
+  size_t frame_counter;
 };
 
 static const char* VaErrorString(VAStatus error) {
@@ -360,6 +362,7 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
   // TODO(mburakov): Check entry points?
 
 #if 1
+  // TODO(mburakov): AMD only supports CQP and no packed headers.
   VAConfigAttrib config_attribs[] = {
       {.type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420},
       {.type = VAConfigAttribRateControl, .value = VA_RC_ICQ},
@@ -520,15 +523,17 @@ static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
   VABufferID buffers[12];
   VABufferID* buffer_ptr = buffers;
-  if (!UploadBuffer(encode_context, VAEncSequenceParameterBufferType,
-                    sizeof(encode_context->seq), &encode_context->seq,
-                    &buffer_ptr)) {
+
+  bool idr =
+      encode_context->frame_counter % encode_context->seq.intra_idr_period == 0;
+  if (idr && !UploadBuffer(encode_context, VAEncSequenceParameterBufferType,
+                           sizeof(encode_context->seq), &encode_context->seq,
+                           &buffer_ptr)) {
     LOG("Failed to upload sequence parameter buffer");
     return false;
   }
 
   bool result = false;
-  bool idr = true;
   if (idr) {
     if (!UploadMiscBuffer(encode_context, VAEncMiscParameterTypeRateControl,
                           sizeof(encode_context->rc), &encode_context->rc,
@@ -546,8 +551,12 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
 
   // TODO(mburakov): Implement this!!!
   encode_context->pic.decoded_curr_pic = (VAPictureHEVC){
-      .picture_id = encode_context->recon_surface_ids[0],  // recon
-      .pic_order_cnt = 0,  // pic->display_order - hpic->last_idr_frame
+      .picture_id =
+          encode_context
+              ->recon_surface_ids[encode_context->frame_counter %
+                                  LENGTH(encode_context->recon_surface_ids)],
+      .pic_order_cnt = (int32_t)(encode_context->frame_counter %
+                                 encode_context->seq.intra_idr_period),
       .flags = 0,
   };
   for (size_t i = 0; i < LENGTH(encode_context->pic.reference_frames); i++) {
@@ -556,10 +565,20 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
         .flags = VA_PICTURE_HEVC_INVALID,
     };
   }
+  if (!idr) {
+    encode_context->pic.reference_frames[0] = (VAPictureHEVC){
+        .picture_id =
+            encode_context
+                ->recon_surface_ids[(encode_context->frame_counter - 1) %
+                                    LENGTH(encode_context->recon_surface_ids)],
+        .pic_order_cnt = (int32_t)((encode_context->frame_counter - 1) %
+                                   encode_context->seq.intra_idr_period),
+    };
+  }
   encode_context->pic.coded_buf = encode_context->output_buffer_id;
-  encode_context->pic.nal_unit_type = IDR_W_RADL;
-  encode_context->pic.pic_fields.bits.idr_pic_flag = 1;
-  encode_context->pic.pic_fields.bits.coding_type = 1;
+  encode_context->pic.nal_unit_type = idr ? IDR_W_RADL : TRAIL_R;
+  encode_context->pic.pic_fields.bits.idr_pic_flag = idr;
+  encode_context->pic.pic_fields.bits.coding_type = idr ? 1 : 2;
   encode_context->pic.pic_fields.bits.reference_pic_flag = 1;
   if (!UploadBuffer(encode_context, VAEncPictureParameterBufferType,
                     sizeof(encode_context->pic), &encode_context->pic,
@@ -718,7 +737,7 @@ case PICTURE_TYPE_P:
       .slice_segment_address = 0,  // calculated
       .num_ctu_in_slice = block_size,
 
-      .slice_type = I,  // calculated
+      .slice_type = idr ? I : P,  // calculated
       .slice_pic_parameter_set_id =
           encode_context->pic.slice_pic_parameter_set_id,
 
@@ -780,6 +799,16 @@ case PICTURE_TYPE_P:
     slice.ref_pic_list1[i].picture_id = VA_INVALID_ID;
     slice.ref_pic_list1[i].flags = VA_PICTURE_HEVC_INVALID;
   }
+  if (!idr) {
+    slice.ref_pic_list0[0] = (VAPictureHEVC){
+        .picture_id =
+            encode_context
+                ->recon_surface_ids[(encode_context->frame_counter - 1) %
+                                    LENGTH(encode_context->recon_surface_ids)],
+        .pic_order_cnt = (int32_t)((encode_context->frame_counter - 1) %
+                                   encode_context->seq.intra_idr_period),
+    };
+  }
 
   // TODO(mburakov): ffmpeg assign reference frame for non-I-frames here.
 
@@ -790,6 +819,8 @@ case PICTURE_TYPE_P:
   };
   const struct MoreSliceParamerters msp = {
       .first_slice_segment_in_pic_flag = 1,
+      .num_negative_pics = 1,
+      .negative_pics = &(struct NegativePics){0, 1},
   };
   PackSliceSegmentHeaderNalUnit(&bitstream, &encode_context->seq,
                                 &encode_context->pic, &slice, &msp);
@@ -843,6 +874,10 @@ case PICTURE_TYPE_P:
     LOG("Failed to map va buffer (%s)", VaErrorString(status));
     goto rollback_buffers;
   }
+  if (segment->next != NULL) {
+    LOG("Next segment non-null!");
+    abort();
+  }
 
   struct iovec iovec[] = {
       {.iov_base = &segment->size, .iov_len = sizeof(segment->size)},
@@ -853,8 +888,8 @@ case PICTURE_TYPE_P:
     goto rollback_segment;
   }
 
-  LOG("GOT FRAME!");
-  result = false;
+  encode_context->frame_counter++;
+  result = true;
 
 rollback_segment:
   vaUnmapBuffer(encode_context->va_display, encode_context->output_buffer_id);

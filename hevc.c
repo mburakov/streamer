@@ -97,6 +97,7 @@ static const bool chroma_qp_offset_list_enabled_flag = 0;
 static const bool deblocking_filter_override_enabled_flag = 0;
 static const bool deblocking_filter_override_flag = 0;
 static const uint32_t num_entry_point_offsets = 0;
+static const bool inter_ref_pic_set_prediction_flag = 0;
 
 // 7.3.1.2 NAL unit header syntax
 static void PackNalUnitHeader(struct Bitstream* bitstream,
@@ -552,6 +553,30 @@ void PackPicParameterSetNalUnit(struct Bitstream* bitstream,
   BitstreamInflate(bitstream, &pps_rbsp);
 }
 
+// 7.3.7 Short-term reference picture set syntax
+static void PackStRefPicSet(struct Bitstream* bitstream, uint32_t stRpsIdx,
+                            const struct MoreSliceParamerters* msp) {
+  if (stRpsIdx != 0)
+    BitstreamAppend(bitstream, 1, inter_ref_pic_set_prediction_flag);
+  if (inter_ref_pic_set_prediction_flag) {
+    // TODO(mburakov): Implement this!
+    abort();
+  } else {
+    BitstreamAppendUE(bitstream, msp->num_negative_pics);
+    BitstreamAppendUE(bitstream, msp->num_positive_pics);
+    for (uint32_t i = 0; i < msp->num_negative_pics; i++) {
+      BitstreamAppendUE(bitstream, msp->negative_pics[i].delta_poc_s0_minus1);
+      BitstreamAppend(bitstream, 1,
+                      msp->negative_pics[i].used_by_curr_pic_s0_flag);
+    }
+    for (uint32_t i = 0; i < msp->num_positive_pics; i++) {
+      BitstreamAppendUE(bitstream, msp->positive_pics[i].delta_poc_s1_minus1);
+      BitstreamAppend(bitstream, 1,
+                      msp->positive_pics[i].used_by_curr_pic_s1_flag);
+    }
+  }
+}
+
 // 7.3.6.1 General slice segment header syntax
 void PackSliceSegmentHeaderNalUnit(struct Bitstream* bitstream,
                                    const VAEncSequenceParameterBufferHEVC* seq,
@@ -603,10 +628,9 @@ void PackSliceSegmentHeaderNalUnit(struct Bitstream* bitstream,
       BitstreamAppend(&slice_rbsp, log2_max_pic_order_cnt_lsb_minus4 + 4,
                       slice_pic_order_cnt_lsb);
       BitstreamAppend(&slice_rbsp, 1, short_term_ref_pic_set_sps_flag);
-      if (!short_term_ref_pic_set_sps_flag) {
-        // TODO(mburakov): Implement this!!!
-        abort();
-      } else if (num_short_term_ref_pic_sets > 0) {
+      if (!short_term_ref_pic_set_sps_flag)
+        PackStRefPicSet(&slice_rbsp, num_short_term_ref_pic_sets, msp);
+      else if (num_short_term_ref_pic_sets > 1) {
         // TODO(mburakov): Implement this!!!
         abort();
       }

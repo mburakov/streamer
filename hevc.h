@@ -23,6 +23,7 @@
 
 // Table 7-1
 enum NalUnitType {
+  TRAIL_R = 1,
   BLA_W_LP = 16,
   IDR_W_RADL = 19,
   IDR_N_LP = 20,
@@ -64,6 +65,17 @@ struct MoreSeqParameters {
 
 struct MoreSliceParamerters {
   bool first_slice_segment_in_pic_flag;
+  // TODO(mburakov): Deduce from picture parameter buffer?
+  uint32_t num_negative_pics;
+  uint32_t num_positive_pics;
+  struct NegativePics {
+    uint32_t delta_poc_s0_minus1;
+    bool used_by_curr_pic_s0_flag;
+  }* negative_pics;
+  struct PositivePics {
+    uint32_t delta_poc_s1_minus1;
+    bool used_by_curr_pic_s1_flag;
+  }* positive_pics;
 };
 
 void PackVideoParameterSetNalUnit(struct Bitstream* bitstream,
