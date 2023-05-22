@@ -43,15 +43,17 @@ enum SliceType {
 struct Bitstream;
 
 struct MoreVideoParameters {
-  uint32_t max_b_depth;
-  uint32_t time_base_num;
-  uint32_t time_base_den;
+  uint32_t vps_max_dec_pic_buffering_minus1;
+  uint32_t vps_max_num_reorder_pics;
 };
 
 struct MoreSeqParameters {
-  uint32_t crop_width;
-  uint32_t crop_height;
-  // TODO(mburakov): Why ffmpeg ignores vui section in seq?
+  uint32_t conf_win_left_offset;
+  uint32_t conf_win_right_offset;
+  uint32_t conf_win_top_offset;
+  uint32_t conf_win_bottom_offset;
+  uint32_t sps_max_dec_pic_buffering_minus1;
+  uint32_t sps_max_num_reorder_pics;
   bool video_signal_type_present_flag;
   bool video_full_range_flag;
   bool colour_description_present_flag;
@@ -83,7 +85,6 @@ void PackVideoParameterSetNalUnit(struct Bitstream* bitstream,
                                   const struct MoreVideoParameters* mvp);
 void PackSeqParameterSetNalUnit(struct Bitstream* bitstream,
                                 const VAEncSequenceParameterBufferHEVC* seq,
-                                const struct MoreVideoParameters* mvp,
                                 const struct MoreSeqParameters* msp);
 void PackPicParameterSetNalUnit(struct Bitstream* bitstream,
                                 const VAEncPictureParameterBufferHEVC* pic);

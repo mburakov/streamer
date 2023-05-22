@@ -226,7 +226,26 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
       .log2_max_pcm_luma_coding_block_size_minus3 = 0,  // ???
 
       // mburakov: ffmpeg hardcodes this to 0.
-      .vui_parameters_present_flag = 0,
+      .vui_parameters_present_flag = 1,
+      .vui_fields.bits =
+          {
+              .aspect_ratio_info_present_flag = 0,           // defaulted
+              .neutral_chroma_indication_flag = 0,           // defaulted
+              .field_seq_flag = 0,                           // defaulted
+              .vui_timing_info_present_flag = 1,             // hardcoded
+              .bitstream_restriction_flag = 1,               // hardcoded
+              .tiles_fixed_structure_flag = 0,               // defaulted
+              .motion_vectors_over_pic_boundaries_flag = 1,  // hardcoded
+              .restricted_ref_pic_lists_flag = 1,            // hardcoded
+              .log2_max_mv_length_horizontal = 15,           // hardcoded
+              .log2_max_mv_length_vertical = 15,             // hardcoded
+          },
+
+      .vui_num_units_in_tick = 1,         // TODO
+      .vui_time_scale = 60,               // TODO
+      .min_spatial_segmentation_idc = 0,  // defaulted
+      .max_bytes_per_pic_denom = 0,       // hardcoded
+      .max_bits_per_min_cu_denom = 0,     // hardcoded
 
       // TODO(mburakov): ffmpeg leaves rest of the structure zero-initialized.
   };
@@ -594,14 +613,23 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
         .size = 0,
     };
     static const struct MoreVideoParameters mvp = {
-        .max_b_depth = 0,
-        .time_base_num = 1,
-        .time_base_den = 60,
+        .vps_max_dec_pic_buffering_minus1 = 1,  // No B-frames
+        .vps_max_num_reorder_pics = 0,          // No B-frames
     };
     PackVideoParameterSetNalUnit(&bitstream, &encode_context->seq, &mvp);
     const struct MoreSeqParameters msp = {
-        .crop_width = encode_context->width,
-        .crop_height = encode_context->height,
+        .conf_win_left_offset = 0,
+        .conf_win_right_offset =
+            (encode_context->seq.pic_width_in_luma_samples -
+             encode_context->width) /
+            2,
+        .conf_win_top_offset = 0,
+        .conf_win_bottom_offset =
+            (encode_context->seq.pic_height_in_luma_samples -
+             encode_context->height) /
+            2,
+        .sps_max_dec_pic_buffering_minus1 = 1,  // No B-frames
+        .sps_max_num_reorder_pics = 0,          // No B-frames
         .video_signal_type_present_flag = 1,
         .video_full_range_flag = 0,  // TODO
         .colour_description_present_flag = 1,
@@ -609,7 +637,7 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
         .transfer_characteristics = 2,  // Unspecified
         .matrix_coeffs = 6,             // TODO
     };
-    PackSeqParameterSetNalUnit(&bitstream, &encode_context->seq, &mvp, &msp);
+    PackSeqParameterSetNalUnit(&bitstream, &encode_context->seq, &msp);
     PackPicParameterSetNalUnit(&bitstream, &encode_context->pic);
     if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSequence,
                             (unsigned int)bitstream.size, bitstream.data,

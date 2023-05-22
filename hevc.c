@@ -54,19 +54,10 @@ static const uint32_t sps_max_latency_increase_plus1 =
     vps_max_latency_increase_plus1;
 static const uint32_t num_short_term_ref_pic_sets = 0;
 static const bool long_term_ref_pics_present_flag = 0;
-static const bool vui_parameters_present_flag = 1;
 static const uint8_t video_format = 5;
-static const bool vui_timing_info_present_flag = 1;
 static const bool vui_poc_proportional_to_timing_flag =
     vps_poc_proportional_to_timing_flag;
 static const bool vui_hrd_parameters_present_flag = 0;
-static const bool bitstream_restriction_flag = 1;
-static const bool motion_vectors_over_pic_boundaries_flag = 1;
-static const bool restricted_ref_pic_lists_flag = 1;
-static const uint32_t max_bytes_per_pic_denom = 0;
-static const uint32_t max_bits_per_min_cu_denom = 0;
-static const uint32_t log2_max_mv_length_horizontal = 15;
-static const uint32_t log2_max_mv_length_vertical = 15;
 static const uint32_t pps_pic_parameter_set_id = 0;
 static const uint32_t pps_seq_parameter_set_id = sps_seq_parameter_set_id;
 static const bool short_term_ref_pic_set_sps_flag = 0;
@@ -74,14 +65,9 @@ static const bool short_term_ref_pic_set_sps_flag = 0;
 // mburakov: Below entries are defaulted by ffmpeg:
 static const bool general_inbld_flag = 0;
 static const bool vps_extension_flag = 0;
-static const bool aspect_ratio_info_present_flag = 0;
 static const bool overscan_info_present_flag = 0;
-static const bool neutral_chroma_indication_flag = 0;
-static const bool field_seq_flag = 0;
 static const bool frame_field_info_present_flag = 0;
 static const bool default_display_window_flag = 0;
-static const bool tiles_fixed_structure_flag = 0;
-static const uint32_t min_spatial_segmentation_idc = 0;
 static const bool sps_extension_present_flag = 0;
 static const bool output_flag_present_flag = 0;
 static const uint8_t num_extra_slice_header_bits = 0;
@@ -238,9 +224,8 @@ void PackVideoParameterSetNalUnit(struct Bitstream* bitstream,
       abort();
     }
 
-    BitstreamAppendUE(
-        &vps_rbsp, mvp->max_b_depth + 1);  // vps_max_dec_pic_buffering_minus1
-    BitstreamAppendUE(&vps_rbsp, mvp->max_b_depth);  // vps_max_num_reorder_pics
+    BitstreamAppendUE(&vps_rbsp, mvp->vps_max_dec_pic_buffering_minus1);
+    BitstreamAppendUE(&vps_rbsp, mvp->vps_max_num_reorder_pics);
     BitstreamAppendUE(&vps_rbsp, vps_max_latency_increase_plus1);
   }
 
@@ -258,8 +243,8 @@ void PackVideoParameterSetNalUnit(struct Bitstream* bitstream,
     // TODO(mburakov): Is this section required?
 
     BitstreamAppend(&vps_rbsp, 32,
-                    mvp->time_base_num);  // vps_num_units_in_tick
-    BitstreamAppend(&vps_rbsp, 32, mvp->time_base_den);  // vps_time_scale
+                    seq->vui_num_units_in_tick);  // vps_num_units_in_tick
+    BitstreamAppend(&vps_rbsp, 32, seq->vui_time_scale);  // vps_time_scale
     BitstreamAppend(&vps_rbsp, 1, vps_poc_proportional_to_timing_flag);
     if (vps_poc_proportional_to_timing_flag) {
       // TODO(mburakov): Implement this!
@@ -285,10 +270,12 @@ void PackVideoParameterSetNalUnit(struct Bitstream* bitstream,
 
 // E.2.1 VUI parameters syntax
 static void PackVuiParameters(struct Bitstream* bitstream,
-                              const struct MoreVideoParameters* mvp,
+                              const VAEncSequenceParameterBufferHEVC* seq,
                               const struct MoreSeqParameters* msp) {
-  BitstreamAppend(bitstream, 1, aspect_ratio_info_present_flag);
-  if (aspect_ratio_info_present_flag) {
+  const typeof(seq->vui_fields.bits)* vui_bits = &seq->vui_fields.bits;
+
+  BitstreamAppend(bitstream, 1, vui_bits->aspect_ratio_info_present_flag);
+  if (vui_bits->aspect_ratio_info_present_flag) {
     // TODO(mburakov): Implement this!
     abort();
   }
@@ -317,13 +304,13 @@ static void PackVuiParameters(struct Bitstream* bitstream,
     BitstreamAppendUE(bitstream, msp->chroma_sample_loc_type_bottom_field);
   }
 
-  BitstreamAppend(bitstream, 1, neutral_chroma_indication_flag);
-  if (neutral_chroma_indication_flag) {
+  BitstreamAppend(bitstream, 1, vui_bits->neutral_chroma_indication_flag);
+  if (vui_bits->neutral_chroma_indication_flag) {
     // TODO(mburakov): Implement this!
     abort();
   }
 
-  BitstreamAppend(bitstream, 1, field_seq_flag);
+  BitstreamAppend(bitstream, 1, vui_bits->field_seq_flag);
   BitstreamAppend(bitstream, 1, frame_field_info_present_flag);
   BitstreamAppend(bitstream, 1, default_display_window_flag);
   if (default_display_window_flag) {
@@ -331,11 +318,10 @@ static void PackVuiParameters(struct Bitstream* bitstream,
     abort();
   }
 
-  BitstreamAppend(bitstream, 1, vui_timing_info_present_flag);
-  if (vui_timing_info_present_flag) {
-    BitstreamAppend(bitstream, 32,
-                    mvp->time_base_num);  // vui_num_units_in_tick
-    BitstreamAppend(bitstream, 32, mvp->time_base_den);  // vui_time_scale
+  BitstreamAppend(bitstream, 1, vui_bits->vui_timing_info_present_flag);
+  if (vui_bits->vui_timing_info_present_flag) {
+    BitstreamAppend(bitstream, 32, seq->vui_num_units_in_tick);
+    BitstreamAppend(bitstream, 32, seq->vui_time_scale);
     BitstreamAppend(bitstream, 1, vui_poc_proportional_to_timing_flag);
     if (vui_poc_proportional_to_timing_flag) {
       // TODO(mburakov): Implement this!
@@ -349,22 +335,22 @@ static void PackVuiParameters(struct Bitstream* bitstream,
     }
   }
 
-  BitstreamAppend(bitstream, 1, bitstream_restriction_flag);
-  if (bitstream_restriction_flag) {
-    BitstreamAppend(bitstream, 1, tiles_fixed_structure_flag);
-    BitstreamAppend(bitstream, 1, motion_vectors_over_pic_boundaries_flag);
-    BitstreamAppend(bitstream, 1, restricted_ref_pic_lists_flag);
-    BitstreamAppendUE(bitstream, min_spatial_segmentation_idc);
-    BitstreamAppendUE(bitstream, max_bytes_per_pic_denom);
-    BitstreamAppendUE(bitstream, max_bits_per_min_cu_denom);
-    BitstreamAppendUE(bitstream, log2_max_mv_length_horizontal);
-    BitstreamAppendUE(bitstream, log2_max_mv_length_vertical);
+  BitstreamAppend(bitstream, 1, vui_bits->bitstream_restriction_flag);
+  if (vui_bits->bitstream_restriction_flag) {
+    BitstreamAppend(bitstream, 1, vui_bits->tiles_fixed_structure_flag);
+    BitstreamAppend(bitstream, 1,
+                    vui_bits->motion_vectors_over_pic_boundaries_flag);
+    BitstreamAppend(bitstream, 1, vui_bits->restricted_ref_pic_lists_flag);
+    BitstreamAppendUE(bitstream, seq->min_spatial_segmentation_idc);
+    BitstreamAppendUE(bitstream, seq->max_bytes_per_pic_denom);
+    BitstreamAppendUE(bitstream, seq->max_bits_per_min_cu_denom);
+    BitstreamAppendUE(bitstream, vui_bits->log2_max_mv_length_horizontal);
+    BitstreamAppendUE(bitstream, vui_bits->log2_max_mv_length_vertical);
   }
 }
 
 void PackSeqParameterSetNalUnit(struct Bitstream* bitstream,
                                 const VAEncSequenceParameterBufferHEVC* seq,
-                                const struct MoreVideoParameters* mvp,
                                 const struct MoreSeqParameters* msp) {
   const typeof(seq->seq_fields.bits)* seq_bits = &seq->seq_fields.bits;
 
@@ -393,25 +379,14 @@ void PackSeqParameterSetNalUnit(struct Bitstream* bitstream,
   BitstreamAppendUE(&sps_rbsp, seq->pic_height_in_luma_samples);
 
   bool conformance_window_flag =
-      msp->crop_width != seq->pic_width_in_luma_samples ||
-      msp->crop_height != seq->pic_height_in_luma_samples;
+      msp->conf_win_left_offset || msp->conf_win_right_offset ||
+      msp->conf_win_top_offset || msp->conf_win_bottom_offset;
   BitstreamAppend(&sps_rbsp, 1, conformance_window_flag);
-
   if (conformance_window_flag) {
-    if (seq_bits->chroma_format_idc != 1) {
-      // TODO(mburakov): Implement this!
-      abort();
-    }
-
-    // mburakov: Offsets are in chroma samples.
-    uint32_t conf_win_right_offset =
-        (seq->pic_width_in_luma_samples - msp->crop_width) / 2;
-    uint32_t conf_win_bottom_offset =
-        (seq->pic_height_in_luma_samples - msp->crop_height) / 2;
-    BitstreamAppendUE(&sps_rbsp, 0);  // conf_win_left_offset
-    BitstreamAppendUE(&sps_rbsp, conf_win_right_offset);
-    BitstreamAppendUE(&sps_rbsp, 0);  // conf_win_top_offset
-    BitstreamAppendUE(&sps_rbsp, conf_win_bottom_offset);
+    BitstreamAppendUE(&sps_rbsp, msp->conf_win_left_offset);
+    BitstreamAppendUE(&sps_rbsp, msp->conf_win_right_offset);
+    BitstreamAppendUE(&sps_rbsp, msp->conf_win_top_offset);
+    BitstreamAppendUE(&sps_rbsp, msp->conf_win_bottom_offset);
   }
 
   BitstreamAppendUE(&sps_rbsp, seq_bits->bit_depth_luma_minus8);
@@ -428,9 +403,8 @@ void PackSeqParameterSetNalUnit(struct Bitstream* bitstream,
       abort();
     }
 
-    BitstreamAppendUE(
-        &sps_rbsp, mvp->max_b_depth + 1);  // vps_max_dec_pic_buffering_minus1
-    BitstreamAppendUE(&sps_rbsp, mvp->max_b_depth);  // vps_max_num_reorder_pics
+    BitstreamAppendUE(&sps_rbsp, msp->sps_max_dec_pic_buffering_minus1);
+    BitstreamAppendUE(&sps_rbsp, msp->sps_max_num_reorder_pics);
     BitstreamAppendUE(&sps_rbsp, sps_max_latency_increase_plus1);
   }
 
@@ -469,8 +443,8 @@ void PackSeqParameterSetNalUnit(struct Bitstream* bitstream,
 
   BitstreamAppend(&sps_rbsp, 1, seq_bits->sps_temporal_mvp_enabled_flag);
   BitstreamAppend(&sps_rbsp, 1, seq_bits->strong_intra_smoothing_enabled_flag);
-  BitstreamAppend(&sps_rbsp, 1, vui_parameters_present_flag);
-  if (vui_parameters_present_flag) PackVuiParameters(&sps_rbsp, mvp, msp);
+  BitstreamAppend(&sps_rbsp, 1, seq->vui_parameters_present_flag);
+  if (seq->vui_parameters_present_flag) PackVuiParameters(&sps_rbsp, seq, msp);
   BitstreamAppend(&sps_rbsp, 1, sps_extension_present_flag);
   if (sps_extension_present_flag) {
     // TODO(mburakov): Implement this!
