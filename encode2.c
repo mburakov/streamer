@@ -46,6 +46,12 @@ struct EncodeContext {
   int render_node;
   VADisplay va_display;
   VAConfigID va_config_id;
+
+  struct {
+    bool packed_header_sequence;
+    bool packed_header_slice;
+  } codec_quirks;
+
   VAContextID va_context_id;
   VASurfaceID input_surface_id;
   struct GpuFrame* gpu_frame;
@@ -108,6 +114,36 @@ static void OnVaLogMessage(void* context, const char* message) {
   size_t len = strlen(message);
   while (message[len - 1] == '\n') len--;
   LOG("%.*s", (int)len, message);
+}
+
+static bool InitializeCodecQuirks(struct EncodeContext* encode_context) {
+  bool result = false;
+  VAProfile dummy_profile;
+  VAEntrypoint dummy_entrypoint;
+  int num_attribs = vaMaxNumConfigAttributes(encode_context->va_display);
+  VAConfigAttrib* attrib_list =
+      malloc((size_t)num_attribs * sizeof(VAConfigAttrib));
+  VAStatus status = vaQueryConfigAttributes(
+      encode_context->va_display, encode_context->va_config_id, &dummy_profile,
+      &dummy_entrypoint, attrib_list, &num_attribs);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to query va config attributes (%s)", VaErrorString(status));
+    goto rollback_attrib_list;
+  }
+
+  for (int i = 0; i < num_attribs; i++) {
+    if (attrib_list[i].type == VAConfigAttribEncPackedHeaders) {
+      encode_context->codec_quirks.packed_header_sequence =
+          !!(attrib_list[i].value & VA_ENC_PACKED_HEADER_SEQUENCE);
+      encode_context->codec_quirks.packed_header_slice =
+          !!(attrib_list[i].value & VA_ENC_PACKED_HEADER_SLICE);
+    }
+  }
+  result = true;
+
+rollback_attrib_list:
+  free(attrib_list);
+  return result;
 }
 
 static struct GpuFrame* VaSurfaceToGpuFrame(VADisplay va_display,
@@ -403,6 +439,11 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
     goto rollback_va_display;
   }
 
+  if (!InitializeCodecQuirks(encode_context)) {
+    LOG("Failed to initialize codec quirks");
+    goto rollback_va_config_id;
+  }
+
   status = vaCreateContext(
       encode_context->va_display, encode_context->va_config_id,
       (int)(width_in_cb * min_cb_size), (int)(height_in_cb * min_cb_size),
@@ -606,7 +647,7 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     goto rollback_buffers;
   }
 
-  if (idr) {
+  if (encode_context->codec_quirks.packed_header_sequence && idr) {
     char buffer[256];
     struct Bitstream bitstream = {
         .data = buffer,
@@ -840,23 +881,25 @@ case PICTURE_TYPE_P:
 
   // TODO(mburakov): ffmpeg assign reference frame for non-I-frames here.
 
-  char buffer[256];
-  struct Bitstream bitstream = {
-      .data = buffer,
-      .size = 0,
-  };
-  const struct MoreSliceParamerters msp = {
-      .first_slice_segment_in_pic_flag = 1,
-      .num_negative_pics = 1,
-      .negative_pics = &(struct NegativePics){0, 1},
-  };
-  PackSliceSegmentHeaderNalUnit(&bitstream, &encode_context->seq,
-                                &encode_context->pic, &slice, &msp);
-  if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSlice,
-                          (unsigned int)bitstream.size, bitstream.data,
-                          &buffer_ptr)) {
-    LOG("Failed to upload packed sequence header");
-    goto rollback_buffers;
+  if (encode_context->codec_quirks.packed_header_slice) {
+    char buffer[256];
+    struct Bitstream bitstream = {
+        .data = buffer,
+        .size = 0,
+    };
+    const struct MoreSliceParamerters msp = {
+        .first_slice_segment_in_pic_flag = 1,
+        .num_negative_pics = 1,
+        .negative_pics = &(struct NegativePics){0, 1},
+    };
+    PackSliceSegmentHeaderNalUnit(&bitstream, &encode_context->seq,
+                                  &encode_context->pic, &slice, &msp);
+    if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSlice,
+                            (unsigned int)bitstream.size, bitstream.data,
+                            &buffer_ptr)) {
+      LOG("Failed to upload packed sequence header");
+      goto rollback_buffers;
+    }
   }
 
   if (!UploadBuffer(encode_context, VAEncSliceParameterBufferType,
