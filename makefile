@@ -12,8 +12,6 @@ libs:=\
 	egl \
 	gbm \
 	glesv2 \
-	libavcodec \
-	libavutil \
 	libdrm \
 	libva \
 	libva-drm

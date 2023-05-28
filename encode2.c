@@ -37,11 +37,8 @@ struct EncodeContext {
   struct GpuContext* gpu_context;
   uint32_t width;
   uint32_t height;
-
-  VAEncSequenceParameterBufferHEVC seq;
-  VAEncPictureParameterBufferHEVC pic;
-  VAEncMiscParameterRateControl rc;
-  VAEncMiscParameterFrameRate fr;
+  enum YuvColorspace colorspace;
+  enum YuvRange range;
 
   int render_node;
   VADisplay va_display;
@@ -59,6 +56,9 @@ struct EncodeContext {
   VASurfaceID recon_surface_ids[2];
   VABufferID output_buffer_id;
 
+  VAEncSequenceParameterBufferHEVC seq;
+  VAEncPictureParameterBufferHEVC pic;
+  VAEncSliceParameterBufferHEVC slice;
   size_t frame_counter;
 };
 
@@ -190,30 +190,9 @@ release_planes:
   return NULL;
 }
 
-struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
-                                          uint32_t width, uint32_t height,
-                                          enum YuvColorspace colorspace,
-                                          enum YuvRange range) {
-  struct EncodeContext* encode_context = malloc(sizeof(struct EncodeContext));
-  if (!encode_context) {
-    LOG("Faield to allocate encode context (%s)", strerror(errno));
-    return NULL;
-  }
-
-  // TODO(mburakov): ffmpeg attempts to deduce this.
-  static const uint32_t min_cb_size = 16;
-  uint32_t width_in_cb = (width + min_cb_size - 1) / min_cb_size;
-  uint32_t height_in_cb = (height + min_cb_size - 1) / min_cb_size;
-
-  // TODO(mburakov): in the same deduction slice block size is set to 32.
-
-  *encode_context = (struct EncodeContext){
-      .gpu_context = gpu_context,
-      .width = width,
-      .height = height,
-  };
-
-  // TODO(mburakov): ffmpeg initializes SPS like this.
+static void InitializeSeqHeader(struct EncodeContext* encode_context,
+                                uint16_t pic_width_in_luma_samples,
+                                uint16_t pic_height_in_luma_samples) {
   encode_context->seq = (VAEncSequenceParameterBufferHEVC){
       .general_profile_idc = 1,  // Main profile
       .general_level_idc = 120,  // Level 4
@@ -222,10 +201,10 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
       .intra_period = 120,      // Where this one comes from?
       .intra_idr_period = 120,  // Each I frame is an IDR frame
       .ip_period = 1,           // No B-frames
-      .bits_per_second = 0,     // To be configured later?
+      .bits_per_second = 0,     // TODO (investigate)
 
-      .pic_width_in_luma_samples = (uint16_t)(width_in_cb * min_cb_size),
-      .pic_height_in_luma_samples = (uint16_t)(height_in_cb * min_cb_size),
+      .pic_width_in_luma_samples = pic_width_in_luma_samples,
+      .pic_height_in_luma_samples = pic_height_in_luma_samples,
 
       .seq_fields.bits =
           {
@@ -233,35 +212,33 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
               .separate_colour_plane_flag = 0,           // Table 6-1
               .bit_depth_luma_minus8 = 0,                // 8 bpp luma
               .bit_depth_chroma_minus8 = 0,              // 8 bpp chroma
-              .scaling_list_enabled_flag = 0,            // ???
-              .strong_intra_smoothing_enabled_flag = 0,  // ???
+              .scaling_list_enabled_flag = 0,            // defaulted
+              .strong_intra_smoothing_enabled_flag = 0,  // defaulted
 
               // mburakov: ffmpeg hardcodes these for i965 Skylake driver.
-              .amp_enabled_flag = 1,
-              .sample_adaptive_offset_enabled_flag = 0,
-              .pcm_enabled_flag = 0,
-              .pcm_loop_filter_disabled_flag = 0,  // ???
-              .sps_temporal_mvp_enabled_flag = 0,
+              .amp_enabled_flag = 1,                     // TODO (quirks)
+              .sample_adaptive_offset_enabled_flag = 0,  // TODO (quirks)
+              .pcm_enabled_flag = 0,                     // TODO (quirks)
+              .pcm_loop_filter_disabled_flag = 0,        // defaulted
+              .sps_temporal_mvp_enabled_flag = 0,        // TODO (quirks)
 
-              // TODO(mburakov): ffmeg does not set below flags.
-              // .low_delay_seq = 0,     // Probably should be 1
-              // .hierachical_flag = 0,  // ???
+              .low_delay_seq = 1,     // No B-frames
+              .hierachical_flag = 0,  // defaulted
           },
 
       // mburakov: ffmpeg hardcodes these for i965 Skylake driver.
-      .log2_min_luma_coding_block_size_minus3 = 0,
-      .log2_diff_max_min_luma_coding_block_size = 2,
-      .log2_min_transform_block_size_minus2 = 0,
-      .log2_diff_max_min_transform_block_size = 3,
-      .max_transform_hierarchy_depth_inter = 3,
-      .max_transform_hierarchy_depth_intra = 3,
+      .log2_min_luma_coding_block_size_minus3 = 0,    // TODO (quirks)
+      .log2_diff_max_min_luma_coding_block_size = 2,  // TODO (quirks)
+      .log2_min_transform_block_size_minus2 = 0,      // hardcoded
+      .log2_diff_max_min_transform_block_size = 3,    // hardcoded
+      .max_transform_hierarchy_depth_inter = 3,       // hardcoded
+      .max_transform_hierarchy_depth_intra = 3,       // hardcoded
 
-      .pcm_sample_bit_depth_luma_minus1 = 0,            // ???
-      .pcm_sample_bit_depth_chroma_minus1 = 0,          // ???
-      .log2_min_pcm_luma_coding_block_size_minus3 = 0,  // ???
-      .log2_max_pcm_luma_coding_block_size_minus3 = 0,  // ???
+      .pcm_sample_bit_depth_luma_minus1 = 0,            // defaulted
+      .pcm_sample_bit_depth_chroma_minus1 = 0,          // defaulted
+      .log2_min_pcm_luma_coding_block_size_minus3 = 0,  // defaulted
+      .log2_max_pcm_luma_coding_block_size_minus3 = 0,  // defaulted
 
-      // mburakov: ffmpeg hardcodes this to 0.
       .vui_parameters_present_flag = 1,
       .vui_fields.bits =
           {
@@ -277,115 +254,189 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
               .log2_max_mv_length_vertical = 15,             // hardcoded
           },
 
-      .vui_num_units_in_tick = 1,         // TODO
-      .vui_time_scale = 60,               // TODO
+      .vui_num_units_in_tick = 1,         // TODO (investigate)
+      .vui_time_scale = 60,               // TODO (investigate)
       .min_spatial_segmentation_idc = 0,  // defaulted
       .max_bytes_per_pic_denom = 0,       // hardcoded
       .max_bits_per_min_cu_denom = 0,     // hardcoded
 
-      // TODO(mburakov): ffmpeg leaves rest of the structure zero-initialized.
+      .scc_fields.bits =
+          {
+              .palette_mode_enabled_flag = 0,  // defaulted
+          },
   };
+}
 
-  // TODO(mburakov): ffmpeg initializes PPS like this.
+static void InitializePicHeader(struct EncodeContext* encode_context) {
+  const typeof(encode_context->seq.seq_fields.bits)* seq_bits =
+      &encode_context->seq.seq_fields.bits;
+
+  uint8_t collocated_ref_pic_index =
+      seq_bits->sps_temporal_mvp_enabled_flag ? 0 : 0xff;
+
   encode_context->pic = (VAEncPictureParameterBufferHEVC){
-      .decoded_curr_pic.picture_id = VA_INVALID_ID,
-      .decoded_curr_pic.flags = VA_PICTURE_HEVC_INVALID,
+      .decoded_curr_pic =
+          {
+              .picture_id = VA_INVALID_ID,       // dynamic
+              .flags = VA_PICTURE_HEVC_INVALID,  // dynamic
+          },
 
-      .coded_buf = VA_INVALID_ID,
-      .collocated_ref_pic_index =
-          encode_context->seq.seq_fields.bits.sps_temporal_mvp_enabled_flag
-              ? 0
-              : 0xff,
+      // .reference_frames[15],
 
-      .last_picture = 0,
+      .coded_buf = encode_context->output_buffer_id,
+      .collocated_ref_pic_index = collocated_ref_pic_index,
+      .last_picture = 0,  // hardcoded
 
-      // mburakov: ffmpeg hardcodes initial value for non-CQP rate control.
-      .pic_init_qp = 30,
-      .diff_cu_qp_delta_depth = 0,
-      .pps_cb_qp_offset = 0,
-      .pps_cr_qp_offset = 0,
+      .pic_init_qp = 30,            // Fixed quality
+      .diff_cu_qp_delta_depth = 0,  // Fixed quality
+      .pps_cb_qp_offset = 0,        // hardcoded
+      .pps_cr_qp_offset = 0,        // hardcoded
 
       .num_tile_columns_minus1 = 0,  // No tiles
       .num_tile_rows_minus1 = 0,     // No tiles
+      .column_width_minus1 = {0},    // No tiles
+      .row_height_minus1 = {0},      // No tiles
 
-      .log2_parallel_merge_level_minus2 = 0,  // ???
-      // mburakov: ffmpeg hardcodes this to 0.
-      .ctu_max_bitsize_allowed = 0,
-
-      // mburakov: ffmpeg hardcodes both to 0.
-      .num_ref_idx_l0_default_active_minus1 = 0,
-      .num_ref_idx_l1_default_active_minus1 = 0,
-
-      // TODO(mburakov): Should this be incremented on IDR?
-      .slice_pic_parameter_set_id = 0,
-
-      // TODO(mburakov): ffmeg does not set below value.
-      // .nal_unit_type = 0,
+      .log2_parallel_merge_level_minus2 = 0,      // defaulted
+      .ctu_max_bitsize_allowed = 0,               // hardcoded
+      .num_ref_idx_l0_default_active_minus1 = 0,  // hardcoded
+      .num_ref_idx_l1_default_active_minus1 = 0,  // hardcoded
+      .slice_pic_parameter_set_id = 0,            // hardcoded
+      .nal_unit_type = 0,                         // dynamic
 
       .pic_fields.bits =
           {
-              // mburakov: ffmpeg sets the flags below for each picture.
-              // .idr_pic_flag = 0,
-              // .coding_type = 0,
-              // .reference_pic_flag = 0,
+              .idr_pic_flag = 0,        // dynamic
+              .coding_type = 0,         // dynamic
+              .reference_pic_flag = 1,  // No B-frames
 
-              // TODO(mburakov): ffmpeg does not set the flag below.
-              // .dependent_slice_segments_enabled_flag = 0,
-
-              .sign_data_hiding_enabled_flag = 0,  // ???
-              .constrained_intra_pred_flag = 0,    // ???
-
-              // TODO(mburakov): ffmpeg attempts to deduce the flag below.
-              .transform_skip_enabled_flag = 0,
-
-              // mburakov: ffmpeg enables thit for non-CQP rate control.
-              .cu_qp_delta_enabled_flag = 1,
-
-              .weighted_pred_flag = 0,                     // ???
-              .weighted_bipred_flag = 0,                   // ???
-              .transquant_bypass_enabled_flag = 0,         // ???
+              .dependent_slice_segments_enabled_flag = 0,  // defaulted
+              .sign_data_hiding_enabled_flag = 0,          // defaulted
+              .constrained_intra_pred_flag = 0,            // defaulted
+              .transform_skip_enabled_flag = 0,            // TODO (quirks)
+              .cu_qp_delta_enabled_flag = 0,               // Fixed quality
+              .weighted_pred_flag = 0,                     // defaulted
+              .weighted_bipred_flag = 0,                   // defaulted
+              .transquant_bypass_enabled_flag = 0,         // defaulted
               .tiles_enabled_flag = 0,                     // No tiles
-              .entropy_coding_sync_enabled_flag = 0,       // ???
+              .entropy_coding_sync_enabled_flag = 0,       // defaulted
               .loop_filter_across_tiles_enabled_flag = 0,  // No tiles
 
-              // mburakov: ffmpeg hardcodes the flag below.
-              .pps_loop_filter_across_slices_enabled_flag = 1,
+              .pps_loop_filter_across_slices_enabled_flag = 1,  // hardcoded
+              .scaling_list_data_present_flag = 0,              // defaulted
 
-              .scaling_list_data_present_flag = 0,  // ???
-
-              // mburakov: ffmpeg hardcodes the flags below.
-              .screen_content_flag = 0,
-              .enable_gpu_weighted_prediction = 0,
-              .no_output_of_prior_pics_flag = 0,
+              .screen_content_flag = 0,             // TODO (investigate)
+              .enable_gpu_weighted_prediction = 0,  // hardcoded
+              .no_output_of_prior_pics_flag = 0,    // hardcoded
           },
 
-      // TODO(mburakov): ffmpeg does not set values below.
-      // .hierarchical_level_plus1 = 0,  // ???
-      // .scc_fields.value = 0,          // ???
+      .hierarchical_level_plus1 = 0,  // defaulted
+      .scc_fields.bits =
+          {
+              .pps_curr_pic_ref_enabled_flag = 0,  // defaulted
+          },
   };
 
-  // TODO(mburakov): ffmpeg initializes RC like this:
-  encode_context->rc = (VAEncMiscParameterRateControl){
-      .bits_per_second = 0,      // Hardcoded for non-bitrate
-      .target_percentage = 100,  // Hardcoded for non-bitrate
-      .window_size = 1000,       // Hardcoded for non-AVBR
-      .initial_qp = 0,           // Hardcoded
-      .min_qp = 0,               // Comes from context
-      .basic_unit_size = 0,      // Hardcoded
-      .ICQ_quality_factor = 28,  // Comes from context - clipped [1, 51]
-      .max_qp = 0,               // Comes from context
-      .quality_factor = 28,      // Comes from context - non-clipped
+  for (size_t i = 0; i < LENGTH(encode_context->pic.reference_frames); i++) {
+    encode_context->pic.reference_frames[i] = (VAPictureHEVC){
+        .picture_id = VA_INVALID_ID,
+        .flags = VA_PICTURE_HEVC_INVALID,
+    };
+  }
+}
 
-      // TODO(mburakov): ffmpeg does not set below value.
-      // .target_frame_size = 0,
+static void InitializeSliceHeader(struct EncodeContext* encode_context,
+                                  uint32_t num_ctu_in_slice) {
+  const typeof(encode_context->seq.seq_fields.bits)* seq_bits =
+      &encode_context->seq.seq_fields.bits;
+
+  encode_context->slice = (VAEncSliceParameterBufferHEVC){
+      .slice_segment_address = 0,  // No slice segments
+      .num_ctu_in_slice = num_ctu_in_slice,
+
+      .slice_type = 0,  // dynamic
+      .slice_pic_parameter_set_id =
+          encode_context->pic.slice_pic_parameter_set_id,
+
+      .num_ref_idx_l0_active_minus1 =
+          encode_context->pic.num_ref_idx_l0_default_active_minus1,
+      .num_ref_idx_l1_active_minus1 =
+          encode_context->pic.num_ref_idx_l1_default_active_minus1,
+
+      .luma_log2_weight_denom = 0,          // defaulted
+      .delta_chroma_log2_weight_denom = 0,  // defaulted
+
+      // .delta_luma_weight_l0[15],
+      // .luma_offset_l0[15],
+      // .delta_chroma_weight_l0[15][2],
+      // .chroma_offset_l0[15][2],
+      // .delta_luma_weight_l1[15],
+      // .luma_offset_l1[15],
+      // .delta_chroma_weight_l1[15][2],
+      // .chroma_offset_l1[15][2],
+
+      .max_num_merge_cand = 5,  // defaulted
+      .slice_qp_delta = 0,      // Fixed quality
+      .slice_cb_qp_offset = 0,  // defaulted
+      .slice_cr_qp_offset = 0,  // defaulted
+
+      .slice_beta_offset_div2 = 0,  // defaulted
+      .slice_tc_offset_div2 = 0,    // defaulted
+
+      .slice_fields.bits =
+          {
+              .last_slice_of_pic_flag = 1,        // No slice segments
+              .dependent_slice_segment_flag = 0,  // No slice segments
+              .colour_plane_id = 0,               // defaulted
+              .slice_temporal_mvp_enabled_flag =
+                  seq_bits->sps_temporal_mvp_enabled_flag,
+              .slice_sao_luma_flag =
+                  seq_bits->sample_adaptive_offset_enabled_flag,
+              .slice_sao_chroma_flag =
+                  seq_bits->sample_adaptive_offset_enabled_flag,
+              .num_ref_idx_active_override_flag = 0,              // hardcoded
+              .mvd_l1_zero_flag = 0,                              // defaulted
+              .cabac_init_flag = 0,                               // defaulted
+              .slice_deblocking_filter_disabled_flag = 0,         // defaulted
+              .slice_loop_filter_across_slices_enabled_flag = 0,  // defaulted
+              .collocated_from_l0_flag = 0,                       // No B-frames
+          },
+
+      .pred_weight_table_bit_offset = 0,  // defaulted
+      .pred_weight_table_bit_length = 0,  // defaulted
   };
 
-  // TODO(mburakov): ffmpeg initializes FR like this:
-  encode_context->fr = (VAEncMiscParameterFrameRate){
-      .framerate = (1 << 16) | 60,  // Comes from context
+  for (size_t i = 0; i < LENGTH(encode_context->slice.ref_pic_list0); i++) {
+    encode_context->slice.ref_pic_list0[i] = (VAPictureHEVC){
+        .picture_id = VA_INVALID_ID,
+        .flags = VA_PICTURE_HEVC_INVALID,
+    };
+  }
 
-      // TODO(mburakov): ffmpeg does not set below value.
-      // .framerate_flags.value = 0,
+  for (size_t i = 0; i < LENGTH(encode_context->slice.ref_pic_list1); i++) {
+    encode_context->slice.ref_pic_list1[i] = (VAPictureHEVC){
+        .picture_id = VA_INVALID_ID,
+        .flags = VA_PICTURE_HEVC_INVALID,
+    };
+  }
+}
+
+struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
+                                          uint32_t width, uint32_t height,
+                                          enum YuvColorspace colorspace,
+                                          enum YuvRange range) {
+  struct EncodeContext* encode_context = malloc(sizeof(struct EncodeContext));
+  if (!encode_context) {
+    LOG("Faield to allocate encode context (%s)", strerror(errno));
+    return NULL;
+  }
+
+  *encode_context = (struct EncodeContext){
+      .gpu_context = gpu_context,
+      .width = width,
+      .height = height,
+      .colorspace = colorspace,
+      .range = range,
   };
 
   encode_context->render_node = open("/dev/dri/renderD128", O_RDWR);
@@ -401,7 +452,6 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
   }
 
   vaSetErrorCallback(encode_context->va_display, OnVaLogMessage, NULL);
-
 #ifndef NDEBUG
   vaSetInfoCallback(encode_context->va_display, OnVaLogMessage, NULL);
 #endif  // NDEBUG
@@ -416,24 +466,12 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
   LOG("Initialized VA %d.%d", major, minor);
   // TODO(mburakov): Check entry points?
 
-#if 1
-  // TODO(mburakov): AMD only supports CQP and no packed headers.
-  VAConfigAttrib config_attribs[] = {
+  VAConfigAttrib attrib_list[] = {
       {.type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420},
-      {.type = VAConfigAttribRateControl, .value = VA_RC_ICQ},
-      {.type = VAConfigAttribEncPackedHeaders,
-       .value = VA_ENC_PACKED_HEADER_MISC | VA_ENC_PACKED_HEADER_SLICE |
-                VA_ENC_PACKED_HEADER_SEQUENCE},
   };
-#else
-  VAConfigAttrib config_attribs[] = {
-      {.type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420},
-      {.type = VAConfigAttribRateControl, .value = VA_RC_CQP},
-  };
-#endif
-  status = vaCreateConfig(
-      encode_context->va_display, VAProfileHEVCMain, VAEntrypointEncSlice,
-      config_attribs, LENGTH(config_attribs), &encode_context->va_config_id);
+  status = vaCreateConfig(encode_context->va_display, VAProfileHEVCMain,
+                          VAEntrypointEncSlice, attrib_list,
+                          LENGTH(attrib_list), &encode_context->va_config_id);
   if (status != VA_STATUS_SUCCESS) {
     LOG("Failed to create va config (%s)", VaErrorString(status));
     goto rollback_va_display;
@@ -443,6 +481,19 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
     LOG("Failed to initialize codec quirks");
     goto rollback_va_config_id;
   }
+
+  // TODO(mburakov): ffmpeg attempts to deduce this.
+  static const uint32_t min_cb_size = 16;
+  uint32_t width_in_cb = (width + min_cb_size - 1) / min_cb_size;
+  uint32_t height_in_cb = (height + min_cb_size - 1) / min_cb_size;
+
+  // TODO(mburakov): ffmpeg attempts to deduce this.
+  static const uint32_t slice_block_size = 32;
+  uint32_t slice_block_rows =
+      (encode_context->width + slice_block_size - 1) / slice_block_size;
+  uint32_t slice_block_cols =
+      (encode_context->height + slice_block_size - 1) / slice_block_size;
+  uint32_t num_ctu_in_slice = slice_block_rows * slice_block_cols;
 
   status = vaCreateContext(
       encode_context->va_display, encode_context->va_config_id,
@@ -489,6 +540,11 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
     LOG("Failed to create va output buffer (%s)", VaErrorString(status));
     goto rollback_recon_surface_ids;
   }
+
+  InitializeSeqHeader(encode_context, (uint16_t)(width_in_cb * min_cb_size),
+                      (uint16_t)(height_in_cb * min_cb_size));
+  InitializePicHeader(encode_context);
+  InitializeSliceHeader(encode_context, num_ctu_in_slice);
   return encode_context;
 
 rollback_recon_surface_ids:
@@ -533,20 +589,6 @@ static bool UploadBuffer(const struct EncodeContext* encode_context,
   return true;
 }
 
-static bool UploadMiscBuffer(const struct EncodeContext* encode_context,
-                             VAEncMiscParameterType misc_parameter_type,
-                             unsigned int size, const void* data,
-                             VABufferID** presult) {
-  uint8_t stack_allocated_storage[sizeof(VAEncMiscParameterBuffer) + size];
-  VAEncMiscParameterBuffer* buffer =
-      (VAEncMiscParameterBuffer*)stack_allocated_storage;
-  buffer->type = misc_parameter_type;
-  memcpy(buffer->data, data, size);
-  return UploadBuffer(encode_context, VAEncMiscParameterBufferType,
-                      (unsigned int)sizeof(stack_allocated_storage),
-                      stack_allocated_storage, presult);
-}
-
 static bool UploadPackedBuffer(const struct EncodeContext* encode_context,
                                VAEncPackedHeaderType packed_header_type,
                                unsigned int bit_length, void* data,
@@ -560,6 +602,39 @@ static bool UploadPackedBuffer(const struct EncodeContext* encode_context,
                       sizeof(packed_header), &packed_header, presult) &&
          UploadBuffer(encode_context, VAEncPackedHeaderDataBufferType,
                       (bit_length + 7) / 8, data, presult);
+}
+
+static void UpdatePicHeader(struct EncodeContext* encode_context, bool idr) {
+  encode_context->pic.decoded_curr_pic = (VAPictureHEVC){
+      .picture_id =
+          encode_context
+              ->recon_surface_ids[encode_context->frame_counter %
+                                  LENGTH(encode_context->recon_surface_ids)],
+      .pic_order_cnt = (int32_t)(encode_context->frame_counter %
+                                 encode_context->seq.intra_idr_period),
+  };
+
+  if (idr) {
+    encode_context->pic.reference_frames[0] = (VAPictureHEVC){
+        .picture_id = VA_INVALID_ID,
+        .flags = VA_PICTURE_HEVC_INVALID,
+    };
+    encode_context->pic.nal_unit_type = IDR_W_RADL;
+    encode_context->pic.pic_fields.bits.idr_pic_flag = 1;
+    encode_context->pic.pic_fields.bits.coding_type = 1;
+  } else {
+    encode_context->pic.reference_frames[0] = (VAPictureHEVC){
+        .picture_id =
+            encode_context
+                ->recon_surface_ids[(encode_context->frame_counter - 1) %
+                                    LENGTH(encode_context->recon_surface_ids)],
+        .pic_order_cnt = (int32_t)((encode_context->frame_counter - 1) %
+                                   encode_context->seq.intra_idr_period),
+    };
+    encode_context->pic.nal_unit_type = TRAIL_R;
+    encode_context->pic.pic_fields.bits.idr_pic_flag = 0;
+    encode_context->pic.pic_fields.bits.coding_type = 2;
+  }
 }
 
 static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
@@ -581,69 +656,16 @@ static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
 }
 
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
-  VABufferID buffers[12];
+  bool result = false;
+  VABufferID buffers[8];
   VABufferID* buffer_ptr = buffers;
 
   bool idr =
-      encode_context->frame_counter % encode_context->seq.intra_idr_period == 0;
+      !(encode_context->frame_counter % encode_context->seq.intra_idr_period);
   if (idr && !UploadBuffer(encode_context, VAEncSequenceParameterBufferType,
                            sizeof(encode_context->seq), &encode_context->seq,
                            &buffer_ptr)) {
     LOG("Failed to upload sequence parameter buffer");
-    return false;
-  }
-
-  bool result = false;
-  if (idr) {
-    if (!UploadMiscBuffer(encode_context, VAEncMiscParameterTypeRateControl,
-                          sizeof(encode_context->rc), &encode_context->rc,
-                          &buffer_ptr)) {
-      LOG("Failed to upload rate control buffer");
-      goto rollback_buffers;
-    }
-    if (!UploadMiscBuffer(encode_context, VAEncMiscParameterTypeFrameRate,
-                          sizeof(encode_context->fr), &encode_context->fr,
-                          &buffer_ptr)) {
-      LOG("Failed to upload frame rate buffer");
-      goto rollback_buffers;
-    }
-  }
-
-  // TODO(mburakov): Implement this!!!
-  encode_context->pic.decoded_curr_pic = (VAPictureHEVC){
-      .picture_id =
-          encode_context
-              ->recon_surface_ids[encode_context->frame_counter %
-                                  LENGTH(encode_context->recon_surface_ids)],
-      .pic_order_cnt = (int32_t)(encode_context->frame_counter %
-                                 encode_context->seq.intra_idr_period),
-      .flags = 0,
-  };
-  for (size_t i = 0; i < LENGTH(encode_context->pic.reference_frames); i++) {
-    encode_context->pic.reference_frames[i] = (VAPictureHEVC){
-        .picture_id = VA_INVALID_ID,
-        .flags = VA_PICTURE_HEVC_INVALID,
-    };
-  }
-  if (!idr) {
-    encode_context->pic.reference_frames[0] = (VAPictureHEVC){
-        .picture_id =
-            encode_context
-                ->recon_surface_ids[(encode_context->frame_counter - 1) %
-                                    LENGTH(encode_context->recon_surface_ids)],
-        .pic_order_cnt = (int32_t)((encode_context->frame_counter - 1) %
-                                   encode_context->seq.intra_idr_period),
-    };
-  }
-  encode_context->pic.coded_buf = encode_context->output_buffer_id;
-  encode_context->pic.nal_unit_type = idr ? IDR_W_RADL : TRAIL_R;
-  encode_context->pic.pic_fields.bits.idr_pic_flag = idr;
-  encode_context->pic.pic_fields.bits.coding_type = idr ? 1 : 2;
-  encode_context->pic.pic_fields.bits.reference_pic_flag = 1;
-  if (!UploadBuffer(encode_context, VAEncPictureParameterBufferType,
-                    sizeof(encode_context->pic), &encode_context->pic,
-                    &buffer_ptr)) {
-    LOG("Failed to upload picture parameter buffer");
     goto rollback_buffers;
   }
 
@@ -653,31 +675,32 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
         .data = buffer,
         .size = 0,
     };
+
     static const struct MoreVideoParameters mvp = {
         .vps_max_dec_pic_buffering_minus1 = 1,  // No B-frames
         .vps_max_num_reorder_pics = 0,          // No B-frames
     };
-    PackVideoParameterSetNalUnit(&bitstream, &encode_context->seq, &mvp);
+    uint32_t conf_win_right_offset_luma =
+        encode_context->seq.pic_width_in_luma_samples - encode_context->width;
+    uint32_t conf_win_bottom_offset_luma =
+        encode_context->seq.pic_height_in_luma_samples - encode_context->height;
     const struct MoreSeqParameters msp = {
         .conf_win_left_offset = 0,
-        .conf_win_right_offset =
-            (encode_context->seq.pic_width_in_luma_samples -
-             encode_context->width) /
-            2,
+        .conf_win_right_offset = conf_win_right_offset_luma / 2,
         .conf_win_top_offset = 0,
-        .conf_win_bottom_offset =
-            (encode_context->seq.pic_height_in_luma_samples -
-             encode_context->height) /
-            2,
+        .conf_win_bottom_offset = conf_win_bottom_offset_luma / 2,
         .sps_max_dec_pic_buffering_minus1 = 1,  // No B-frames
         .sps_max_num_reorder_pics = 0,          // No B-frames
         .video_signal_type_present_flag = 1,
-        .video_full_range_flag = 0,  // TODO
+        .video_full_range_flag = encode_context->range == kFullRange,
         .colour_description_present_flag = 1,
         .colour_primaries = 2,          // Unsepcified
         .transfer_characteristics = 2,  // Unspecified
-        .matrix_coeffs = 6,             // TODO
+        .matrix_coeffs =
+            encode_context->colorspace == kItuRec601 ? 6 : 1,  // Table E.5
     };
+
+    PackVideoParameterSetNalUnit(&bitstream, &encode_context->seq, &mvp);
     PackSeqParameterSetNalUnit(&bitstream, &encode_context->seq, &msp);
     PackPicParameterSetNalUnit(&bitstream, &encode_context->pic);
     if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSequence,
@@ -688,212 +711,37 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     }
   }
 
-  // if (IDR) {
-  //   VAEncSequenceParameterBufferType
-  // }
-  // if (IDR) {
-  //   VAEncMiscParameterBufferType (VAEncMiscParameterTypeRateControl)
-  //   VAEncMiscParameterBufferType (VAEncMiscParameterTypeFrameRate)
-  // }
-  // VAEncPictureParameterBufferType
-  // if (IDR) {
-  //   VAEncPackedHeaderParameterBufferType (VAEncPackedHeaderSequence)
-  //   VAEncPackedHeaderDataBufferType (VPS+SPS+PPS)
-  // }
-  // VAEncPackedHeaderParameterBufferType (VAEncPackedHeaderSlice)
-  // VAEncPackedHeaderDataBufferType (slice header)
-  // VAEncSliceParameterBufferType
-
-#if 0
-if (pic->type == PICTURE_TYPE_IDR) {
-    av_assert0(pic->display_order == pic->encode_order);
-
-    hpic->last_idr_frame = pic->display_order;
-
-    hpic->slice_nal_unit = HEVC_NAL_IDR_W_RADL;
-    hpic->slice_type     = HEVC_SLICE_I;
-    hpic->pic_type       = 0;
-} else {
-    av_assert0(prev);
-    hpic->last_idr_frame = hprev->last_idr_frame;
-
-    if (pic->type == PICTURE_TYPE_I) {
-        hpic->slice_nal_unit = HEVC_NAL_CRA_NUT;
-        hpic->slice_type     = HEVC_SLICE_I;
-        hpic->pic_type       = 0;
-    } else if (pic->type == PICTURE_TYPE_P) {
-        av_assert0(pic->refs[0]);
-        hpic->slice_nal_unit = HEVC_NAL_TRAIL_R;
-        hpic->slice_type     = HEVC_SLICE_P;
-        hpic->pic_type       = 1;
-    } else {
-#endif
-
-  // hpic->slice_nal_unit = HEVC_NAL_IDR_W_RADL;
-  // hpic->slice_type     = HEVC_SLICE_I;
-  // hpic->pic_type       = 0;
-  // hpic->pic_order_cnt = pic->display_order - hpic->last_idr_frame;
-  // priv->sei_needed = 0;
-  //
-  // priv->sei == 56
-  // vpic->decoded_curr_pic = (VAPictureHEVC) {
-  //   .picture_id    = pic->recon_surface,
-  //   .pic_order_cnt = hpic->pic_order_cnt,
-  //   .flags         = 0,
-  // };
-  //
-
-#if 0
-for (i = 0; i < pic->nb_refs; i++) {
-    VAAPIEncodePicture      *ref = pic->refs[i];
-    VAAPIEncodeH265Picture *href;
-
-    av_assert0(ref && ref->encode_order < pic->encode_order);
-    href = ref->priv_data;
-
-    vpic->reference_frames[i] = (VAPictureHEVC) {
-        .picture_id    = ref->recon_surface,
-        .pic_order_cnt = href->pic_order_cnt,
-        .flags = (ref->display_order < pic->display_order ?
-                  VA_PICTURE_HEVC_RPS_ST_CURR_BEFORE : 0) |
-                 (ref->display_order > pic->display_order ?
-                  VA_PICTURE_HEVC_RPS_ST_CURR_AFTER  : 0),
-    };
-}
-for (; i < FF_ARRAY_ELEMS(vpic->reference_frames); i++) {
-    vpic->reference_frames[i] = (VAPictureHEVC) {
-        .picture_id = VA_INVALID_ID,
-        .flags      = VA_PICTURE_HEVC_INVALID,
-    };
-}
-#endif
-
-#if 0
-vpic->coded_buf = pic->output_buffer;
-
-vpic->nal_unit_type = hpic->slice_nal_unit;
-
-switch (pic->type) {
-case PICTURE_TYPE_IDR:
-    vpic->pic_fields.bits.idr_pic_flag       = 1;
-    vpic->pic_fields.bits.coding_type        = 1;
-    vpic->pic_fields.bits.reference_pic_flag = 1;
-    break;
-case PICTURE_TYPE_I:
-    vpic->pic_fields.bits.idr_pic_flag       = 0;
-    vpic->pic_fields.bits.coding_type        = 1;
-    vpic->pic_fields.bits.reference_pic_flag = 1;
-    break;
-case PICTURE_TYPE_P:
-    vpic->pic_fields.bits.idr_pic_flag       = 0;
-    vpic->pic_fields.bits.coding_type        = 2;
-    vpic->pic_fields.bits.reference_pic_flag = 1;
-    break;
-#endif
-
-  // slice_block_rows(34) = (height + slice_block_size - 1) / slice_block_size;
-  // slice_block_cols(60) = (width + slice_block_size - 1) / slice_block_size;
-
-  // TODO(mburakov): see comment in EncodeContextCreate.
-  static const uint32_t slice_block_size = 32;
-  uint32_t slice_block_rows =
-      (encode_context->width + slice_block_size - 1) / slice_block_size;
-  uint32_t slice_block_cols =
-      (encode_context->height + slice_block_size - 1) / slice_block_size;
-  uint32_t block_size = slice_block_rows * slice_block_cols;
-
-  VAEncSliceParameterBufferHEVC slice = {
-      .slice_segment_address = 0,  // calculated
-      .num_ctu_in_slice = block_size,
-
-      .slice_type = idr ? I : P,  // calculated
-      .slice_pic_parameter_set_id =
-          encode_context->pic.slice_pic_parameter_set_id,
-
-      .num_ref_idx_l0_active_minus1 =
-          encode_context->pic.num_ref_idx_l0_default_active_minus1,
-      .num_ref_idx_l1_active_minus1 =
-          encode_context->pic.num_ref_idx_l1_default_active_minus1,
-
-      .luma_log2_weight_denom = 0,          // ???
-      .delta_chroma_log2_weight_denom = 0,  // ???
-
-      // TODO(mburakov): ffmpeg does not initialize below entries.
-      // .delta_luma_weight_l0[15],
-      // .luma_offset_l0[15],
-      // .delta_chroma_weight_l0[15][2],
-      // .chroma_offset_l0[15][2],
-      // .delta_luma_weight_l1[15],
-      // .luma_offset_l1[15],
-      // .delta_chroma_weight_l1[15][2],
-      // .chroma_offset_l1[15][2],
-
-      .max_num_merge_cand = 5 - 0,  // ???
-      .slice_qp_delta = 0,          // evals to zero for CQP???
-      .slice_cb_qp_offset = 0,      // ???
-      .slice_cr_qp_offset = 0,      // ???
-
-      .slice_beta_offset_div2 = 0,  // ???
-      .slice_tc_offset_div2 = 0,    // ???
-
-      .slice_fields.bits =
-          {
-              // TODO(mburakov): We only have a single slice?
-              .last_slice_of_pic_flag = 1,
-              .dependent_slice_segment_flag = 0,  // ???
-              .colour_plane_id = 0,               // ???
-              .slice_temporal_mvp_enabled_flag =
-                  encode_context->seq.seq_fields.bits
-                      .sps_temporal_mvp_enabled_flag,
-              .slice_sao_luma_flag = encode_context->seq.seq_fields.bits
-                                         .sample_adaptive_offset_enabled_flag,
-              .slice_sao_chroma_flag = encode_context->seq.seq_fields.bits
-                                           .sample_adaptive_offset_enabled_flag,
-              .num_ref_idx_active_override_flag = 0,              // ???
-              .mvd_l1_zero_flag = 0,                              // ???
-              .cabac_init_flag = 0,                               // ???
-              .slice_deblocking_filter_disabled_flag = 0,         // ???
-              .slice_loop_filter_across_slices_enabled_flag = 0,  // ???
-              .collocated_from_l0_flag = 0,                       // ???
-          },
-
-      // TODO(mburakov): ffmpeg does not initialize below entries.
-      // .pred_weight_table_bit_offset = 0,
-      // .pred_weight_table_bit_length = 0,
-  };
-
-  for (size_t i = 0; i < LENGTH(slice.ref_pic_list0); i++) {
-    slice.ref_pic_list0[i].picture_id = VA_INVALID_ID;
-    slice.ref_pic_list0[i].flags = VA_PICTURE_HEVC_INVALID;
-    slice.ref_pic_list1[i].picture_id = VA_INVALID_ID;
-    slice.ref_pic_list1[i].flags = VA_PICTURE_HEVC_INVALID;
-  }
-  if (!idr) {
-    slice.ref_pic_list0[0] = (VAPictureHEVC){
-        .picture_id =
-            encode_context
-                ->recon_surface_ids[(encode_context->frame_counter - 1) %
-                                    LENGTH(encode_context->recon_surface_ids)],
-        .pic_order_cnt = (int32_t)((encode_context->frame_counter - 1) %
-                                   encode_context->seq.intra_idr_period),
-    };
+  UpdatePicHeader(encode_context, idr);
+  if (!UploadBuffer(encode_context, VAEncPictureParameterBufferType,
+                    sizeof(encode_context->pic), &encode_context->pic,
+                    &buffer_ptr)) {
+    LOG("Failed to upload picture parameter buffer");
+    goto rollback_buffers;
   }
 
-  // TODO(mburakov): ffmpeg assign reference frame for non-I-frames here.
-
+  encode_context->slice.slice_type = idr ? I : P;
+  encode_context->slice.ref_pic_list0[0] =
+      encode_context->pic.reference_frames[0];
   if (encode_context->codec_quirks.packed_header_slice) {
     char buffer[256];
     struct Bitstream bitstream = {
         .data = buffer,
         .size = 0,
     };
+    static const struct NegativePics negative_pics[] = {
+        {
+            .delta_poc_s0_minus1 = 0,
+            .used_by_curr_pic_s0_flag = true,
+        },
+    };
     const struct MoreSliceParamerters msp = {
         .first_slice_segment_in_pic_flag = 1,
-        .num_negative_pics = 1,
-        .negative_pics = &(struct NegativePics){0, 1},
+        .num_negative_pics = idr ? 0 : LENGTH(negative_pics),
+        .negative_pics = idr ? NULL : negative_pics,
     };
     PackSliceSegmentHeaderNalUnit(&bitstream, &encode_context->seq,
-                                  &encode_context->pic, &slice, &msp);
+                                  &encode_context->pic, &encode_context->slice,
+                                  &msp);
     if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSlice,
                             (unsigned int)bitstream.size, bitstream.data,
                             &buffer_ptr)) {
@@ -903,7 +751,8 @@ case PICTURE_TYPE_P:
   }
 
   if (!UploadBuffer(encode_context, VAEncSliceParameterBufferType,
-                    sizeof(slice), &slice, &buffer_ptr)) {
+                    sizeof(encode_context->slice), &encode_context->slice,
+                    &buffer_ptr)) {
     LOG("Failed to upload slice parameter buffer");
     goto rollback_buffers;
   }
@@ -976,7 +825,7 @@ void EncodeContextDestroy(struct EncodeContext* encode_context) {
                          encode_context->gpu_frame);
   vaDestroySurfaces(encode_context->va_display,
                     &encode_context->input_surface_id, 1);
-  vaDestroyContext(encode_context->va_display, encode_context->va_config_id);
+  vaDestroyContext(encode_context->va_display, encode_context->va_context_id);
   vaDestroyConfig(encode_context->va_display, encode_context->va_config_id);
   vaTerminate(encode_context->va_display);
   close(encode_context->render_node);

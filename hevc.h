@@ -73,11 +73,11 @@ struct MoreSliceParamerters {
   struct NegativePics {
     uint32_t delta_poc_s0_minus1;
     bool used_by_curr_pic_s0_flag;
-  }* negative_pics;
+  } const* negative_pics;
   struct PositivePics {
     uint32_t delta_poc_s1_minus1;
     bool used_by_curr_pic_s1_flag;
-  }* positive_pics;
+  } const* positive_pics;
 };
 
 void PackVideoParameterSetNalUnit(struct Bitstream* bitstream,
