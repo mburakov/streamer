@@ -40,7 +40,6 @@ static const bool vps_sub_layer_ordering_info_present_flag = 0;
 static const uint32_t vps_max_latency_increase_plus1 = 0;
 static const uint8_t vps_max_layer_id = 0;
 static const uint32_t vps_num_layer_sets_minus1 = 0;
-static const bool vps_timing_info_present_flag = 1;
 static const bool vps_poc_proportional_to_timing_flag = 0;
 static const uint32_t vps_num_hrd_parameters = 0;
 static const uint8_t sps_video_parameter_set_id = vps_video_parameter_set_id;
@@ -196,6 +195,8 @@ static void PackRbspTrailingBits(struct Bitstream* bitstream) {
 void PackVideoParameterSetNalUnit(struct Bitstream* bitstream,
                                   const VAEncSequenceParameterBufferHEVC* seq,
                                   const struct MoreVideoParameters* mvp) {
+  const typeof(seq->vui_fields.bits)* vui_bits = &seq->vui_fields.bits;
+
   PackNalUnitHeader(bitstream, VPS_NUT);
 
   char buffer_on_the_stack[64];
@@ -238,10 +239,8 @@ void PackVideoParameterSetNalUnit(struct Bitstream* bitstream,
     }
   }
 
-  BitstreamAppend(&vps_rbsp, 1, vps_timing_info_present_flag);
-  if (vps_timing_info_present_flag) {
-    // TODO(mburakov): Is this section required?
-
+  BitstreamAppend(&vps_rbsp, 1, vui_bits->vui_timing_info_present_flag);
+  if (vui_bits->vui_timing_info_present_flag) {
     BitstreamAppend(&vps_rbsp, 32,
                     seq->vui_num_units_in_tick);  // vps_num_units_in_tick
     BitstreamAppend(&vps_rbsp, 32, seq->vui_time_scale);  // vps_time_scale
