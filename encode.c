@@ -15,6 +15,8 @@
  * along with streamer.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#include "encode.h"
+
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -28,7 +30,6 @@
 #include <va/va_drmcommon.h>
 
 #include "bitstream.h"
-#include "encode.h"
 #include "gpu.h"
 #include "hevc.h"
 #include "toolbox/utils.h"
@@ -44,10 +45,9 @@ struct EncodeContext {
   VADisplay va_display;
   VAConfigID va_config_id;
 
-  struct {
-    bool packed_header_sequence;
-    bool packed_header_slice;
-  } codec_quirks;
+  uint32_t va_packed_headers;
+  VAConfigAttribValEncHEVCFeatures va_hevc_features;
+  VAConfigAttribValEncHEVCBlockSizes va_hevc_block_sizes;
 
   VAContextID va_context_id;
   VASurfaceID input_surface_id;
@@ -116,34 +116,134 @@ static void OnVaLogMessage(void* context, const char* message) {
   LOG("%.*s", (int)len, message);
 }
 
-static bool InitializeCodecQuirks(struct EncodeContext* encode_context) {
-  bool result = false;
-  VAProfile dummy_profile;
-  VAEntrypoint dummy_entrypoint;
-  int num_attribs = vaMaxNumConfigAttributes(encode_context->va_display);
-  VAConfigAttrib* attrib_list =
-      malloc((size_t)num_attribs * sizeof(VAConfigAttrib));
-  VAStatus status = vaQueryConfigAttributes(
-      encode_context->va_display, encode_context->va_config_id, &dummy_profile,
-      &dummy_entrypoint, attrib_list, &num_attribs);
+static bool InitializeCodecCaps(struct EncodeContext* encode_context) {
+  VAConfigAttrib attrib_list[] = {
+      {.type = VAConfigAttribEncPackedHeaders},
+      {.type = VAConfigAttribEncHEVCFeatures},
+      {.type = VAConfigAttribEncHEVCBlockSizes},
+  };
+  VAStatus status = vaGetConfigAttributes(
+      encode_context->va_display, VAProfileHEVCMain, VAEntrypointEncSlice,
+      attrib_list, LENGTH(attrib_list));
   if (status != VA_STATUS_SUCCESS) {
-    LOG("Failed to query va config attributes (%s)", VaErrorString(status));
-    goto rollback_attrib_list;
+    LOG("Failed to get va config attributes (%s)", VaErrorString(status));
+    return false;
   }
 
-  for (int i = 0; i < num_attribs; i++) {
-    if (attrib_list[i].type == VAConfigAttribEncPackedHeaders) {
-      encode_context->codec_quirks.packed_header_sequence =
-          !!(attrib_list[i].value & VA_ENC_PACKED_HEADER_SEQUENCE);
-      encode_context->codec_quirks.packed_header_slice =
-          !!(attrib_list[i].value & VA_ENC_PACKED_HEADER_SLICE);
-    }
+  if (attrib_list[0].value == VA_ATTRIB_NOT_SUPPORTED) {
+    LOG("VAConfigAttribEncPackedHeaders is not supported");
+  } else {
+    LOG("VAConfigAttribEncPackedHeaders is 0x%08x", attrib_list[0].value);
+    encode_context->va_packed_headers = attrib_list[0].value;
   }
-  result = true;
 
-rollback_attrib_list:
-  free(attrib_list);
-  return result;
+  if (attrib_list[1].value == VA_ATTRIB_NOT_SUPPORTED) {
+    LOG("VAConfigAttribEncHEVCFeatures is not supported");
+    encode_context->va_hevc_features = (VAConfigAttribValEncHEVCFeatures){
+        .bits =
+            {
+                // mburakov: ffmpeg hardcodes these for i965 Skylake driver.
+                .separate_colour_planes = 0,     // Table 6-1
+                .scaling_lists = 0,              // No scaling lists
+                .amp = 1,                        // hardcoded
+                .sao = 0,                        // hardcoded
+                .pcm = 0,                        // hardcoded
+                .temporal_mvp = 0,               // hardcoded
+                .strong_intra_smoothing = 0,     // TODO
+                .dependent_slices = 0,           // No slice segments
+                .sign_data_hiding = 0,           // TODO
+                .constrained_intra_pred = 0,     // TODO
+                .transform_skip = 0,             // defaulted
+                .cu_qp_delta = 0,                // Fixed quality
+                .weighted_prediction = 0,        // TODO
+                .transquant_bypass = 0,          // TODO
+                .deblocking_filter_disable = 0,  // TODO
+            },
+    };
+  } else {
+    LOG("VAConfigAttribEncHEVCFeatures is 0x%08x", attrib_list[1].value);
+    encode_context->va_hevc_features.value = attrib_list[1].value;
+  }
+
+  if (attrib_list[2].value == VA_ATTRIB_NOT_SUPPORTED) {
+    LOG("VAConfigAttribEncHEVCBlockSizes is not supported");
+    encode_context->va_hevc_block_sizes = (VAConfigAttribValEncHEVCBlockSizes){
+        .bits =
+            {
+                // mburakov: ffmpeg hardcodes these for i965 Skylake driver.
+                .log2_max_coding_tree_block_size_minus3 = 2,     // hardcoded
+                .log2_min_coding_tree_block_size_minus3 = 0,     // TODO
+                .log2_min_luma_coding_block_size_minus3 = 0,     // hardcoded
+                .log2_max_luma_transform_block_size_minus2 = 3,  // hardcoded
+                .log2_min_luma_transform_block_size_minus2 = 0,  // hardcoded
+                .max_max_transform_hierarchy_depth_inter = 3,    // hardcoded
+                .min_max_transform_hierarchy_depth_inter = 0,    // defaulted
+                .max_max_transform_hierarchy_depth_intra = 3,    // hardcoded
+                .min_max_transform_hierarchy_depth_intra = 0,    // defaulted
+                .log2_max_pcm_coding_block_size_minus3 = 0,      // TODO
+                .log2_min_pcm_coding_block_size_minus3 = 0,      // TODO
+            },
+    };
+  } else {
+    LOG("VAConfigAttribEncHEVCBlockSizes is 0x%08x", attrib_list[2].value);
+    encode_context->va_hevc_block_sizes.value = attrib_list[2].value;
+  }
+
+#ifndef NDEBUG
+  const typeof(encode_context->va_hevc_features.bits)* features_bits =
+      &encode_context->va_hevc_features.bits;
+  const typeof(encode_context->va_hevc_block_sizes.bits)* block_sizes_bits =
+      &encode_context->va_hevc_block_sizes.bits;
+  LOG("VAConfigAttribEncHEVCFeatures dump:"
+      "\n\tseparate_colour_planes = %u"
+      "\n\tscaling_lists = %u"
+      "\n\tamp = %u"
+      "\n\tsao = %u"
+      "\n\tpcm = %u"
+      "\n\ttemporal_mvp = %u"
+      "\n\tstrong_intra_smoothing = %u"
+      "\n\tdependent_slices = %u"
+      "\n\tsign_data_hiding = %u"
+      "\n\tconstrained_intra_pred = %u"
+      "\n\ttransform_skip = %u"
+      "\n\tcu_qp_delta = %u"
+      "\n\tweighted_prediction = %u"
+      "\n\ttransquant_bypass = %u"
+      "\n\tdeblocking_filter_disable = %u",
+      features_bits->separate_colour_planes, features_bits->scaling_lists,
+      features_bits->amp, features_bits->sao, features_bits->pcm,
+      features_bits->temporal_mvp, features_bits->strong_intra_smoothing,
+      features_bits->dependent_slices, features_bits->sign_data_hiding,
+      features_bits->constrained_intra_pred, features_bits->transform_skip,
+      features_bits->cu_qp_delta, features_bits->weighted_prediction,
+      features_bits->transquant_bypass,
+      features_bits->deblocking_filter_disable);
+  LOG("VAConfigAttribEncHEVCBlockSizes dump:"
+      "\n\tlog2_max_coding_tree_block_size_minus3 = %u"
+      "\n\tlog2_min_coding_tree_block_size_minus3 = %u"
+      "\n\tlog2_min_luma_coding_block_size_minus3 = %u"
+      "\n\tlog2_max_luma_transform_block_size_minus2 = %u"
+      "\n\tlog2_min_luma_transform_block_size_minus2 = %u"
+      "\n\tmax_max_transform_hierarchy_depth_inter = %u"
+      "\n\tmin_max_transform_hierarchy_depth_inter = %u"
+      "\n\tmax_max_transform_hierarchy_depth_intra = %u"
+      "\n\tmin_max_transform_hierarchy_depth_intra = %u"
+      "\n\tlog2_max_pcm_coding_block_size_minus3 = %u"
+      "\n\tlog2_min_pcm_coding_block_size_minus3 = %u",
+      block_sizes_bits->log2_max_coding_tree_block_size_minus3,
+      block_sizes_bits->log2_min_coding_tree_block_size_minus3,
+      block_sizes_bits->log2_min_luma_coding_block_size_minus3,
+      block_sizes_bits->log2_max_luma_transform_block_size_minus2,
+      block_sizes_bits->log2_min_luma_transform_block_size_minus2,
+      block_sizes_bits->max_max_transform_hierarchy_depth_inter,
+      block_sizes_bits->min_max_transform_hierarchy_depth_inter,
+      block_sizes_bits->max_max_transform_hierarchy_depth_intra,
+      block_sizes_bits->min_max_transform_hierarchy_depth_intra,
+      block_sizes_bits->log2_max_pcm_coding_block_size_minus3,
+      block_sizes_bits->log2_min_pcm_coding_block_size_minus3);
+#endif
+
+  return true;
 }
 
 static struct GpuFrame* VaSurfaceToGpuFrame(VADisplay va_display,
@@ -193,6 +293,18 @@ release_planes:
 static void InitializeSeqHeader(struct EncodeContext* encode_context,
                                 uint16_t pic_width_in_luma_samples,
                                 uint16_t pic_height_in_luma_samples) {
+  const typeof(encode_context->va_hevc_features.bits)* features_bits =
+      &encode_context->va_hevc_features.bits;
+  const typeof(encode_context->va_hevc_block_sizes.bits)* block_sizes_bits =
+      &encode_context->va_hevc_block_sizes.bits;
+
+  uint8_t log2_diff_max_min_luma_coding_block_size =
+      block_sizes_bits->log2_max_coding_tree_block_size_minus3 -
+      block_sizes_bits->log2_min_luma_coding_block_size_minus3;
+  uint8_t log2_diff_max_min_transform_block_size =
+      block_sizes_bits->log2_max_luma_transform_block_size_minus2 -
+      block_sizes_bits->log2_min_luma_transform_block_size_minus2;
+
   encode_context->seq = (VAEncSequenceParameterBufferHEVC){
       .general_profile_idc = 1,  // Main profile
       .general_level_idc = 120,  // Level 4
@@ -201,7 +313,7 @@ static void InitializeSeqHeader(struct EncodeContext* encode_context,
       .intra_period = 120,      // Where this one comes from?
       .intra_idr_period = 120,  // Each I frame is an IDR frame
       .ip_period = 1,           // No B-frames
-      .bits_per_second = 0,     // TODO (investigate)
+      .bits_per_second = 0,     // TODO
 
       .pic_width_in_luma_samples = pic_width_in_luma_samples,
       .pic_height_in_luma_samples = pic_height_in_luma_samples,
@@ -212,27 +324,31 @@ static void InitializeSeqHeader(struct EncodeContext* encode_context,
               .separate_colour_plane_flag = 0,           // Table 6-1
               .bit_depth_luma_minus8 = 0,                // 8 bpp luma
               .bit_depth_chroma_minus8 = 0,              // 8 bpp chroma
-              .scaling_list_enabled_flag = 0,            // defaulted
+              .scaling_list_enabled_flag = 0,            // No scaling lists
               .strong_intra_smoothing_enabled_flag = 0,  // defaulted
 
-              // mburakov: ffmpeg hardcodes these for i965 Skylake driver.
-              .amp_enabled_flag = 1,                     // TODO (quirks)
-              .sample_adaptive_offset_enabled_flag = 0,  // TODO (quirks)
-              .pcm_enabled_flag = 0,                     // TODO (quirks)
-              .pcm_loop_filter_disabled_flag = 0,        // defaulted
-              .sps_temporal_mvp_enabled_flag = 0,        // TODO (quirks)
+              .amp_enabled_flag = features_bits->amp,
+              .sample_adaptive_offset_enabled_flag = features_bits->sao,
+              .pcm_enabled_flag = features_bits->pcm,
+              .pcm_loop_filter_disabled_flag = 0,  // defaulted
+              .sps_temporal_mvp_enabled_flag = features_bits->temporal_mvp,
 
               .low_delay_seq = 1,     // No B-frames
               .hierachical_flag = 0,  // defaulted
           },
 
-      // mburakov: ffmpeg hardcodes these for i965 Skylake driver.
-      .log2_min_luma_coding_block_size_minus3 = 0,    // TODO (quirks)
-      .log2_diff_max_min_luma_coding_block_size = 2,  // TODO (quirks)
-      .log2_min_transform_block_size_minus2 = 0,      // hardcoded
-      .log2_diff_max_min_transform_block_size = 3,    // hardcoded
-      .max_transform_hierarchy_depth_inter = 3,       // hardcoded
-      .max_transform_hierarchy_depth_intra = 3,       // hardcoded
+      .log2_min_luma_coding_block_size_minus3 =
+          block_sizes_bits->log2_min_luma_coding_block_size_minus3,
+      .log2_diff_max_min_luma_coding_block_size =
+          log2_diff_max_min_luma_coding_block_size,
+      .log2_min_transform_block_size_minus2 =
+          block_sizes_bits->log2_min_luma_transform_block_size_minus2,
+      .log2_diff_max_min_transform_block_size =
+          log2_diff_max_min_transform_block_size,
+      .max_transform_hierarchy_depth_inter =
+          block_sizes_bits->max_max_transform_hierarchy_depth_inter,
+      .max_transform_hierarchy_depth_intra =
+          block_sizes_bits->max_max_transform_hierarchy_depth_intra,
 
       .pcm_sample_bit_depth_luma_minus1 = 0,            // defaulted
       .pcm_sample_bit_depth_chroma_minus1 = 0,          // defaulted
@@ -245,7 +361,7 @@ static void InitializeSeqHeader(struct EncodeContext* encode_context,
               .aspect_ratio_info_present_flag = 0,           // defaulted
               .neutral_chroma_indication_flag = 0,           // defaulted
               .field_seq_flag = 0,                           // defaulted
-              .vui_timing_info_present_flag = 1,             // hardcoded
+              .vui_timing_info_present_flag = 0,             // No timing
               .bitstream_restriction_flag = 1,               // hardcoded
               .tiles_fixed_structure_flag = 0,               // defaulted
               .motion_vectors_over_pic_boundaries_flag = 1,  // hardcoded
@@ -254,8 +370,8 @@ static void InitializeSeqHeader(struct EncodeContext* encode_context,
               .log2_max_mv_length_vertical = 15,             // hardcoded
           },
 
-      .vui_num_units_in_tick = 1,         // TODO (investigate)
-      .vui_time_scale = 60,               // TODO (investigate)
+      .vui_num_units_in_tick = 0,         // No timing
+      .vui_time_scale = 0,                // No timing
       .min_spatial_segmentation_idc = 0,  // defaulted
       .max_bytes_per_pic_denom = 0,       // hardcoded
       .max_bits_per_min_cu_denom = 0,     // hardcoded
@@ -270,6 +386,8 @@ static void InitializeSeqHeader(struct EncodeContext* encode_context,
 static void InitializePicHeader(struct EncodeContext* encode_context) {
   const typeof(encode_context->seq.seq_fields.bits)* seq_bits =
       &encode_context->seq.seq_fields.bits;
+  const typeof(encode_context->va_hevc_features.bits)* features_bits =
+      &encode_context->va_hevc_features.bits;
 
   uint8_t collocated_ref_pic_index =
       seq_bits->sps_temporal_mvp_enabled_flag ? 0 : 0xff;
@@ -313,7 +431,7 @@ static void InitializePicHeader(struct EncodeContext* encode_context) {
               .dependent_slice_segments_enabled_flag = 0,  // defaulted
               .sign_data_hiding_enabled_flag = 0,          // defaulted
               .constrained_intra_pred_flag = 0,            // defaulted
-              .transform_skip_enabled_flag = 0,            // TODO (quirks)
+              .transform_skip_enabled_flag = features_bits->transform_skip,
               .cu_qp_delta_enabled_flag = 0,               // Fixed quality
               .weighted_pred_flag = 0,                     // defaulted
               .weighted_bipred_flag = 0,                   // defaulted
@@ -323,9 +441,9 @@ static void InitializePicHeader(struct EncodeContext* encode_context) {
               .loop_filter_across_tiles_enabled_flag = 0,  // No tiles
 
               .pps_loop_filter_across_slices_enabled_flag = 1,  // hardcoded
-              .scaling_list_data_present_flag = 0,              // defaulted
+              .scaling_list_data_present_flag = 0,  // No scaling lists
 
-              .screen_content_flag = 0,             // TODO (investigate)
+              .screen_content_flag = 0,             // TODO
               .enable_gpu_weighted_prediction = 0,  // hardcoded
               .no_output_of_prior_pics_flag = 0,    // hardcoded
           },
@@ -345,10 +463,18 @@ static void InitializePicHeader(struct EncodeContext* encode_context) {
   }
 }
 
-static void InitializeSliceHeader(struct EncodeContext* encode_context,
-                                  uint32_t num_ctu_in_slice) {
+static void InitializeSliceHeader(struct EncodeContext* encode_context) {
   const typeof(encode_context->seq.seq_fields.bits)* seq_bits =
       &encode_context->seq.seq_fields.bits;
+  const typeof(encode_context->va_hevc_block_sizes.bits)* block_sizes_bits =
+      &encode_context->va_hevc_block_sizes.bits;
+
+  uint32_t ctu_size =
+      1 << (block_sizes_bits->log2_max_coding_tree_block_size_minus3 + 3);
+  uint32_t slice_block_rows =
+      (encode_context->height + ctu_size - 1) / ctu_size;
+  uint32_t slice_block_cols = (encode_context->width + ctu_size - 1) / ctu_size;
+  uint32_t num_ctu_in_slice = slice_block_rows * slice_block_cols;
 
   encode_context->slice = (VAEncSliceParameterBufferHEVC){
       .slice_segment_address = 0,  // No slice segments
@@ -477,28 +603,25 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
     goto rollback_va_display;
   }
 
-  if (!InitializeCodecQuirks(encode_context)) {
-    LOG("Failed to initialize codec quirks");
+  if (!InitializeCodecCaps(encode_context)) {
+    LOG("Failed to initialize codec caps");
     goto rollback_va_config_id;
   }
 
-  // TODO(mburakov): ffmpeg attempts to deduce this.
+  // mburakov: Intel fails badly when min_cb_size value is not set to 16 and
+  // log2_min_luma_coding_block_size_minus3 is not set to zero. Judging from
+  // ffmpeg code, calculating one from another should work on other platforms,
+  // but I hardcoded it instead since AMD is fine with alignment on 16 anyway.
   static const uint32_t min_cb_size = 16;
-  uint32_t width_in_cb = (width + min_cb_size - 1) / min_cb_size;
-  uint32_t height_in_cb = (height + min_cb_size - 1) / min_cb_size;
+  uint32_t aligned_width =
+      (encode_context->width + min_cb_size - 1) & ~(min_cb_size - 1);
+  uint32_t aligned_height =
+      (encode_context->height + min_cb_size - 1) & ~(min_cb_size - 1);
 
-  // TODO(mburakov): ffmpeg attempts to deduce this.
-  static const uint32_t slice_block_size = 32;
-  uint32_t slice_block_rows =
-      (encode_context->width + slice_block_size - 1) / slice_block_size;
-  uint32_t slice_block_cols =
-      (encode_context->height + slice_block_size - 1) / slice_block_size;
-  uint32_t num_ctu_in_slice = slice_block_rows * slice_block_cols;
-
-  status = vaCreateContext(
-      encode_context->va_display, encode_context->va_config_id,
-      (int)(width_in_cb * min_cb_size), (int)(height_in_cb * min_cb_size),
-      VA_PROGRESSIVE, NULL, 0, &encode_context->va_context_id);
+  status =
+      vaCreateContext(encode_context->va_display, encode_context->va_config_id,
+                      (int)aligned_width, (int)aligned_height, VA_PROGRESSIVE,
+                      NULL, 0, &encode_context->va_context_id);
   if (status != VA_STATUS_SUCCESS) {
     LOG("Failed to create va context (%s)", VaErrorString(status));
     goto rollback_va_config_id;
@@ -520,11 +643,10 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
     goto rollback_input_surface_id;
   }
 
-  status =
-      vaCreateSurfaces(encode_context->va_display, VA_RT_FORMAT_YUV420,
-                       width_in_cb * min_cb_size, height_in_cb * min_cb_size,
-                       encode_context->recon_surface_ids,
-                       LENGTH(encode_context->recon_surface_ids), NULL, 0);
+  status = vaCreateSurfaces(encode_context->va_display, VA_RT_FORMAT_YUV420,
+                            aligned_width, aligned_height,
+                            encode_context->recon_surface_ids,
+                            LENGTH(encode_context->recon_surface_ids), NULL, 0);
   if (status != VA_STATUS_SUCCESS) {
     LOG("Failed to create va recon surfaces (%s)", VaErrorString(status));
     goto rollback_gpu_frame;
@@ -541,10 +663,10 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
     goto rollback_recon_surface_ids;
   }
 
-  InitializeSeqHeader(encode_context, (uint16_t)(width_in_cb * min_cb_size),
-                      (uint16_t)(height_in_cb * min_cb_size));
+  InitializeSeqHeader(encode_context, (uint16_t)aligned_width,
+                      (uint16_t)aligned_height);
   InitializePicHeader(encode_context);
-  InitializeSliceHeader(encode_context, num_ctu_in_slice);
+  InitializeSliceHeader(encode_context);
   return encode_context;
 
 rollback_recon_surface_ids:
@@ -669,7 +791,8 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     goto rollback_buffers;
   }
 
-  if (encode_context->codec_quirks.packed_header_sequence && idr) {
+  if (idr &&
+      (encode_context->va_packed_headers & VA_ENC_PACKED_HEADER_SEQUENCE)) {
     char buffer[256];
     struct Bitstream bitstream = {
         .data = buffer,
@@ -722,7 +845,7 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
   encode_context->slice.slice_type = idr ? I : P;
   encode_context->slice.ref_pic_list0[0] =
       encode_context->pic.reference_frames[0];
-  if (encode_context->codec_quirks.packed_header_slice) {
+  if (encode_context->va_packed_headers & VA_ENC_PACKED_HEADER_SLICE) {
     char buffer[256];
     struct Bitstream bitstream = {
         .data = buffer,
