@@ -6,8 +6,6 @@ obj+=\
 	toolbox/buffer.o \
 	toolbox/io_muxer.o
 
-obj:=$(filter-out encode.o,$(obj))
-
 libs:=\
 	egl \
 	gbm \

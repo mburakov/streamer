@@ -15,168 +15,169 @@
  * along with streamer.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "encode.h"
-
 #include <assert.h>
-#include <drm_fourcc.h>
 #include <errno.h>
-#include <libavcodec/avcodec.h>
-#include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_vaapi.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <va/va.h>
+#include <va/va_drm.h>
 #include <va/va_drmcommon.h>
 
+#include "bitstream.h"
+#include "encode.h"
 #include "gpu.h"
+#include "hevc.h"
 #include "toolbox/utils.h"
 
 struct EncodeContext {
   struct GpuContext* gpu_context;
-  AVBufferRef* hwdevice_context;
-  AVCodecContext* codec_context;
+  uint32_t width;
+  uint32_t height;
+  enum YuvColorspace colorspace;
+  enum YuvRange range;
 
-  AVFrame* hw_frame;
+  int render_node;
+  VADisplay va_display;
+  VAConfigID va_config_id;
+
+  struct {
+    bool packed_header_sequence;
+    bool packed_header_slice;
+  } codec_quirks;
+
+  VAContextID va_context_id;
+  VASurfaceID input_surface_id;
   struct GpuFrame* gpu_frame;
+
+  VASurfaceID recon_surface_ids[2];
+  VABufferID output_buffer_id;
+
+  VAEncSequenceParameterBufferHEVC seq;
+  VAEncPictureParameterBufferHEVC pic;
+  VAEncSliceParameterBufferHEVC slice;
+  size_t frame_counter;
 };
 
-static bool SetHwFramesContext(struct EncodeContext* encode_context, int width,
-                               int height) {
-  encode_context->codec_context->hw_frames_ctx =
-      av_hwframe_ctx_alloc(encode_context->hwdevice_context);
-  if (!encode_context->codec_context->hw_frames_ctx) {
-    LOG("Failed to allocate hwframes context");
-    return false;
-  }
-
-  AVHWFramesContext* hwframes_context_data =
-      (void*)(encode_context->codec_context->hw_frames_ctx->data);
-  hwframes_context_data->initial_pool_size = 8;
-  hwframes_context_data->format = AV_PIX_FMT_VAAPI;
-  hwframes_context_data->sw_format = AV_PIX_FMT_NV12;
-  hwframes_context_data->width = width;
-  hwframes_context_data->height = height;
-  int err = av_hwframe_ctx_init(encode_context->codec_context->hw_frames_ctx);
-  if (err < 0) {
-    LOG("Failed to init hwframes context (%s)", av_err2str(err));
-    av_buffer_unref(&encode_context->codec_context->hw_frames_ctx);
-    return false;
-  }
-  return true;
+static const char* VaErrorString(VAStatus error) {
+  static const char* va_error_strings[] = {
+      "VA_STATUS_SUCCESS",
+      "VA_STATUS_ERROR_OPERATION_FAILED",
+      "VA_STATUS_ERROR_ALLOCATION_FAILED",
+      "VA_STATUS_ERROR_INVALID_DISPLAY",
+      "VA_STATUS_ERROR_INVALID_CONFIG",
+      "VA_STATUS_ERROR_INVALID_CONTEXT",
+      "VA_STATUS_ERROR_INVALID_SURFACE",
+      "VA_STATUS_ERROR_INVALID_BUFFER",
+      "VA_STATUS_ERROR_INVALID_IMAGE",
+      "VA_STATUS_ERROR_INVALID_SUBPICTURE",
+      "VA_STATUS_ERROR_ATTR_NOT_SUPPORTED",
+      "VA_STATUS_ERROR_MAX_NUM_EXCEEDED",
+      "VA_STATUS_ERROR_UNSUPPORTED_PROFILE",
+      "VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT",
+      "VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT",
+      "VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE",
+      "VA_STATUS_ERROR_SURFACE_BUSY",
+      "VA_STATUS_ERROR_FLAG_NOT_SUPPORTED",
+      "VA_STATUS_ERROR_INVALID_PARAMETER",
+      "VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED",
+      "VA_STATUS_ERROR_UNIMPLEMENTED",
+      "VA_STATUS_ERROR_SURFACE_IN_DISPLAYING",
+      "VA_STATUS_ERROR_INVALID_IMAGE_FORMAT",
+      "VA_STATUS_ERROR_DECODING_ERROR",
+      "VA_STATUS_ERROR_ENCODING_ERROR",
+      "VA_STATUS_ERROR_INVALID_VALUE",
+      "???",
+      "???",
+      "???",
+      "???",
+      "???",
+      "???",
+      "VA_STATUS_ERROR_UNSUPPORTED_FILTER",
+      "VA_STATUS_ERROR_INVALID_FILTER_CHAIN",
+      "VA_STATUS_ERROR_HW_BUSY",
+      "???",
+      "VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE",
+      "VA_STATUS_ERROR_NOT_ENOUGH_BUFFER",
+      "VA_STATUS_ERROR_TIMEDOUT",
+  };
+  return VA_STATUS_SUCCESS <= error && error <= VA_STATUS_ERROR_TIMEDOUT
+             ? va_error_strings[error - VA_STATUS_SUCCESS]
+             : "???";
 }
 
-static enum AVColorSpace ConvertColorspace(enum YuvColorspace colorspace) {
-  switch (colorspace) {
-    case kItuRec601:
-      // TODO(mburakov): No dedicated definition for BT601?
-      return AVCOL_SPC_SMPTE170M;
-    case kItuRec709:
-      return AVCOL_SPC_BT709;
-    default:
-      __builtin_unreachable();
-  }
+static void OnVaLogMessage(void* context, const char* message) {
+  (void)context;
+  size_t len = strlen(message);
+  while (message[len - 1] == '\n') len--;
+  LOG("%.*s", (int)len, message);
 }
 
-static enum AVColorRange ConvertRange(enum YuvRange range) {
-  switch (range) {
-    case kNarrowRange:
-      return AVCOL_RANGE_MPEG;
-    case kFullRange:
-      return AVCOL_RANGE_JPEG;
-    default:
-      __builtin_unreachable();
+static bool InitializeCodecQuirks(struct EncodeContext* encode_context) {
+  bool result = false;
+  VAProfile dummy_profile;
+  VAEntrypoint dummy_entrypoint;
+  int num_attribs = vaMaxNumConfigAttributes(encode_context->va_display);
+  VAConfigAttrib* attrib_list =
+      malloc((size_t)num_attribs * sizeof(VAConfigAttrib));
+  VAStatus status = vaQueryConfigAttributes(
+      encode_context->va_display, encode_context->va_config_id, &dummy_profile,
+      &dummy_entrypoint, attrib_list, &num_attribs);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to query va config attributes (%s)", VaErrorString(status));
+    goto rollback_attrib_list;
   }
+
+  for (int i = 0; i < num_attribs; i++) {
+    if (attrib_list[i].type == VAConfigAttribEncPackedHeaders) {
+      encode_context->codec_quirks.packed_header_sequence =
+          !!(attrib_list[i].value & VA_ENC_PACKED_HEADER_SEQUENCE);
+      encode_context->codec_quirks.packed_header_slice =
+          !!(attrib_list[i].value & VA_ENC_PACKED_HEADER_SLICE);
+    }
+  }
+  result = true;
+
+rollback_attrib_list:
+  free(attrib_list);
+  return result;
 }
 
-struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
-                                          uint32_t width, uint32_t height,
-                                          enum YuvColorspace colrospace,
-                                          enum YuvRange range) {
-  struct EncodeContext* encode_context = malloc(sizeof(struct EncodeContext));
-  if (!encode_context) {
-    LOG("Failed to allocate encode context (%s)", strerror(errno));
+static struct GpuFrame* VaSurfaceToGpuFrame(VADisplay va_display,
+                                            VASurfaceID va_surface_id,
+                                            struct GpuContext* gpu_context) {
+  VADRMPRIMESurfaceDescriptor prime;
+  VAStatus status = vaExportSurfaceHandle(
+      va_display, va_surface_id, VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+      VA_EXPORT_SURFACE_WRITE_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &prime);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to export va surface (%s)", VaErrorString(status));
     return NULL;
   }
-  *encode_context = (struct EncodeContext){
-      .gpu_context = gpu_context,
-  };
 
-  int err = av_hwdevice_ctx_create(&encode_context->hwdevice_context,
-                                   AV_HWDEVICE_TYPE_VAAPI, NULL, NULL, 0);
-  if (err < 0) {
-    LOG("Failed to create hwdevice context (%s)", av_err2str(err));
-    goto rollback_encode_context;
-  }
-
-  static const char codec_name[] = "hevc_vaapi";
-  const AVCodec* codec = avcodec_find_encoder_by_name(codec_name);
-  if (!codec) {
-    LOG("Failed to find %s encoder", codec_name);
-    goto rollback_hwdevice_context;
-  }
-  encode_context->codec_context = avcodec_alloc_context3(codec);
-  if (!encode_context->codec_context) {
-    LOG("Failed to allocate codec context");
-    goto rollback_hwdevice_context;
-  }
-
-  encode_context->codec_context->time_base = (AVRational){1, 60};
-  encode_context->codec_context->width = (int)width;
-  encode_context->codec_context->height = (int)height;
-  encode_context->codec_context->pix_fmt = AV_PIX_FMT_VAAPI;
-  encode_context->codec_context->max_b_frames = 0;
-  encode_context->codec_context->refs = 1;
-  encode_context->codec_context->global_quality = 28;
-  encode_context->codec_context->colorspace = ConvertColorspace(colrospace);
-  encode_context->codec_context->color_range = ConvertRange(range);
-
-  if (!SetHwFramesContext(encode_context, (int)width, (int)height)) {
-    LOG("Failed to set hwframes context");
-    goto rollback_codec_context;
-  }
-  err = avcodec_open2(encode_context->codec_context, codec, NULL);
-  if (err < 0) {
-    LOG("Failed to open codec (%s)", av_err2str(err));
-    goto rollback_codec_context;
-  }
-  return encode_context;
-
-rollback_codec_context:
-  avcodec_free_context(&encode_context->codec_context);
-rollback_hwdevice_context:
-  av_buffer_unref(&encode_context->hwdevice_context);
-rollback_encode_context:
-  free(encode_context);
-  return NULL;
-}
-
-static struct GpuFrame* PrimeToGpuFrame(
-    struct GpuContext* gpu_context, const VADRMPRIMESurfaceDescriptor* prime) {
-  struct GpuFramePlane planes[] = {
-      {.dmabuf_fd = -1},
-      {.dmabuf_fd = -1},
-      {.dmabuf_fd = -1},
-      {.dmabuf_fd = -1},
-  };
-  static_assert(LENGTH(planes) == LENGTH(prime->layers[0].object_index),
+  struct GpuFramePlane planes[] = {{.dmabuf_fd = -1},
+                                   {.dmabuf_fd = -1},
+                                   {.dmabuf_fd = -1},
+                                   {.dmabuf_fd = -1}};
+  static_assert(LENGTH(planes) == LENGTH(prime.layers[0].object_index),
                 "Suspicious VADRMPRIMESurfaceDescriptor structure");
 
-  for (size_t i = 0; i < prime->layers[0].num_planes; i++) {
-    uint32_t object_index = prime->layers[0].object_index[i];
+  for (size_t i = 0; i < prime.layers[0].num_planes; i++) {
+    uint32_t object_index = prime.layers[0].object_index[i];
     planes[i] = (struct GpuFramePlane){
-        .dmabuf_fd = prime->objects[object_index].fd,
-        .pitch = prime->layers[0].pitch[i],
-        .offset = prime->layers[0].offset[i],
-        .modifier = prime->objects[object_index].drm_format_modifier,
+        .dmabuf_fd = prime.objects[object_index].fd,
+        .pitch = prime.layers[0].pitch[i],
+        .offset = prime.layers[0].offset[i],
+        .modifier = prime.objects[object_index].drm_format_modifier,
     };
   }
 
   struct GpuFrame* gpu_frame =
-      GpuContextCreateFrame(gpu_context, prime->width, prime->height,
-                            prime->fourcc, prime->layers[0].num_planes, planes);
+      GpuContextCreateFrame(gpu_context, prime.width, prime.height,
+                            prime.fourcc, prime.layers[0].num_planes, planes);
   if (!gpu_frame) {
     LOG("Failed to create gpu frame");
     goto release_planes;
@@ -189,73 +190,465 @@ release_planes:
   return NULL;
 }
 
-const struct GpuFrame* EncodeContextGetFrame(
-    struct EncodeContext* encode_context) {
-  AVFrame* hw_frame = av_frame_alloc();
-  if (!hw_frame) {
-    LOG("Failed to allocate hwframe");
+static void InitializeSeqHeader(struct EncodeContext* encode_context,
+                                uint16_t pic_width_in_luma_samples,
+                                uint16_t pic_height_in_luma_samples) {
+  encode_context->seq = (VAEncSequenceParameterBufferHEVC){
+      .general_profile_idc = 1,  // Main profile
+      .general_level_idc = 120,  // Level 4
+      .general_tier_flag = 0,    // Main tier
+
+      .intra_period = 120,      // Where this one comes from?
+      .intra_idr_period = 120,  // Each I frame is an IDR frame
+      .ip_period = 1,           // No B-frames
+      .bits_per_second = 0,     // TODO (investigate)
+
+      .pic_width_in_luma_samples = pic_width_in_luma_samples,
+      .pic_height_in_luma_samples = pic_height_in_luma_samples,
+
+      .seq_fields.bits =
+          {
+              .chroma_format_idc = 1,                    // 4:2:0
+              .separate_colour_plane_flag = 0,           // Table 6-1
+              .bit_depth_luma_minus8 = 0,                // 8 bpp luma
+              .bit_depth_chroma_minus8 = 0,              // 8 bpp chroma
+              .scaling_list_enabled_flag = 0,            // defaulted
+              .strong_intra_smoothing_enabled_flag = 0,  // defaulted
+
+              // mburakov: ffmpeg hardcodes these for i965 Skylake driver.
+              .amp_enabled_flag = 1,                     // TODO (quirks)
+              .sample_adaptive_offset_enabled_flag = 0,  // TODO (quirks)
+              .pcm_enabled_flag = 0,                     // TODO (quirks)
+              .pcm_loop_filter_disabled_flag = 0,        // defaulted
+              .sps_temporal_mvp_enabled_flag = 0,        // TODO (quirks)
+
+              .low_delay_seq = 1,     // No B-frames
+              .hierachical_flag = 0,  // defaulted
+          },
+
+      // mburakov: ffmpeg hardcodes these for i965 Skylake driver.
+      .log2_min_luma_coding_block_size_minus3 = 0,    // TODO (quirks)
+      .log2_diff_max_min_luma_coding_block_size = 2,  // TODO (quirks)
+      .log2_min_transform_block_size_minus2 = 0,      // hardcoded
+      .log2_diff_max_min_transform_block_size = 3,    // hardcoded
+      .max_transform_hierarchy_depth_inter = 3,       // hardcoded
+      .max_transform_hierarchy_depth_intra = 3,       // hardcoded
+
+      .pcm_sample_bit_depth_luma_minus1 = 0,            // defaulted
+      .pcm_sample_bit_depth_chroma_minus1 = 0,          // defaulted
+      .log2_min_pcm_luma_coding_block_size_minus3 = 0,  // defaulted
+      .log2_max_pcm_luma_coding_block_size_minus3 = 0,  // defaulted
+
+      .vui_parameters_present_flag = 1,
+      .vui_fields.bits =
+          {
+              .aspect_ratio_info_present_flag = 0,           // defaulted
+              .neutral_chroma_indication_flag = 0,           // defaulted
+              .field_seq_flag = 0,                           // defaulted
+              .vui_timing_info_present_flag = 1,             // hardcoded
+              .bitstream_restriction_flag = 1,               // hardcoded
+              .tiles_fixed_structure_flag = 0,               // defaulted
+              .motion_vectors_over_pic_boundaries_flag = 1,  // hardcoded
+              .restricted_ref_pic_lists_flag = 1,            // hardcoded
+              .log2_max_mv_length_horizontal = 15,           // hardcoded
+              .log2_max_mv_length_vertical = 15,             // hardcoded
+          },
+
+      .vui_num_units_in_tick = 1,         // TODO (investigate)
+      .vui_time_scale = 60,               // TODO (investigate)
+      .min_spatial_segmentation_idc = 0,  // defaulted
+      .max_bytes_per_pic_denom = 0,       // hardcoded
+      .max_bits_per_min_cu_denom = 0,     // hardcoded
+
+      .scc_fields.bits =
+          {
+              .palette_mode_enabled_flag = 0,  // defaulted
+          },
+  };
+}
+
+static void InitializePicHeader(struct EncodeContext* encode_context) {
+  const typeof(encode_context->seq.seq_fields.bits)* seq_bits =
+      &encode_context->seq.seq_fields.bits;
+
+  uint8_t collocated_ref_pic_index =
+      seq_bits->sps_temporal_mvp_enabled_flag ? 0 : 0xff;
+
+  encode_context->pic = (VAEncPictureParameterBufferHEVC){
+      .decoded_curr_pic =
+          {
+              .picture_id = VA_INVALID_ID,       // dynamic
+              .flags = VA_PICTURE_HEVC_INVALID,  // dynamic
+          },
+
+      // .reference_frames[15],
+
+      .coded_buf = encode_context->output_buffer_id,
+      .collocated_ref_pic_index = collocated_ref_pic_index,
+      .last_picture = 0,  // hardcoded
+
+      .pic_init_qp = 30,            // Fixed quality
+      .diff_cu_qp_delta_depth = 0,  // Fixed quality
+      .pps_cb_qp_offset = 0,        // hardcoded
+      .pps_cr_qp_offset = 0,        // hardcoded
+
+      .num_tile_columns_minus1 = 0,  // No tiles
+      .num_tile_rows_minus1 = 0,     // No tiles
+      .column_width_minus1 = {0},    // No tiles
+      .row_height_minus1 = {0},      // No tiles
+
+      .log2_parallel_merge_level_minus2 = 0,      // defaulted
+      .ctu_max_bitsize_allowed = 0,               // hardcoded
+      .num_ref_idx_l0_default_active_minus1 = 0,  // hardcoded
+      .num_ref_idx_l1_default_active_minus1 = 0,  // hardcoded
+      .slice_pic_parameter_set_id = 0,            // hardcoded
+      .nal_unit_type = 0,                         // dynamic
+
+      .pic_fields.bits =
+          {
+              .idr_pic_flag = 0,        // dynamic
+              .coding_type = 0,         // dynamic
+              .reference_pic_flag = 1,  // No B-frames
+
+              .dependent_slice_segments_enabled_flag = 0,  // defaulted
+              .sign_data_hiding_enabled_flag = 0,          // defaulted
+              .constrained_intra_pred_flag = 0,            // defaulted
+              .transform_skip_enabled_flag = 0,            // TODO (quirks)
+              .cu_qp_delta_enabled_flag = 0,               // Fixed quality
+              .weighted_pred_flag = 0,                     // defaulted
+              .weighted_bipred_flag = 0,                   // defaulted
+              .transquant_bypass_enabled_flag = 0,         // defaulted
+              .tiles_enabled_flag = 0,                     // No tiles
+              .entropy_coding_sync_enabled_flag = 0,       // defaulted
+              .loop_filter_across_tiles_enabled_flag = 0,  // No tiles
+
+              .pps_loop_filter_across_slices_enabled_flag = 1,  // hardcoded
+              .scaling_list_data_present_flag = 0,              // defaulted
+
+              .screen_content_flag = 0,             // TODO (investigate)
+              .enable_gpu_weighted_prediction = 0,  // hardcoded
+              .no_output_of_prior_pics_flag = 0,    // hardcoded
+          },
+
+      .hierarchical_level_plus1 = 0,  // defaulted
+      .scc_fields.bits =
+          {
+              .pps_curr_pic_ref_enabled_flag = 0,  // defaulted
+          },
+  };
+
+  for (size_t i = 0; i < LENGTH(encode_context->pic.reference_frames); i++) {
+    encode_context->pic.reference_frames[i] = (VAPictureHEVC){
+        .picture_id = VA_INVALID_ID,
+        .flags = VA_PICTURE_HEVC_INVALID,
+    };
+  }
+}
+
+static void InitializeSliceHeader(struct EncodeContext* encode_context,
+                                  uint32_t num_ctu_in_slice) {
+  const typeof(encode_context->seq.seq_fields.bits)* seq_bits =
+      &encode_context->seq.seq_fields.bits;
+
+  encode_context->slice = (VAEncSliceParameterBufferHEVC){
+      .slice_segment_address = 0,  // No slice segments
+      .num_ctu_in_slice = num_ctu_in_slice,
+
+      .slice_type = 0,  // dynamic
+      .slice_pic_parameter_set_id =
+          encode_context->pic.slice_pic_parameter_set_id,
+
+      .num_ref_idx_l0_active_minus1 =
+          encode_context->pic.num_ref_idx_l0_default_active_minus1,
+      .num_ref_idx_l1_active_minus1 =
+          encode_context->pic.num_ref_idx_l1_default_active_minus1,
+
+      .luma_log2_weight_denom = 0,          // defaulted
+      .delta_chroma_log2_weight_denom = 0,  // defaulted
+
+      // .delta_luma_weight_l0[15],
+      // .luma_offset_l0[15],
+      // .delta_chroma_weight_l0[15][2],
+      // .chroma_offset_l0[15][2],
+      // .delta_luma_weight_l1[15],
+      // .luma_offset_l1[15],
+      // .delta_chroma_weight_l1[15][2],
+      // .chroma_offset_l1[15][2],
+
+      .max_num_merge_cand = 5,  // defaulted
+      .slice_qp_delta = 0,      // Fixed quality
+      .slice_cb_qp_offset = 0,  // defaulted
+      .slice_cr_qp_offset = 0,  // defaulted
+
+      .slice_beta_offset_div2 = 0,  // defaulted
+      .slice_tc_offset_div2 = 0,    // defaulted
+
+      .slice_fields.bits =
+          {
+              .last_slice_of_pic_flag = 1,        // No slice segments
+              .dependent_slice_segment_flag = 0,  // No slice segments
+              .colour_plane_id = 0,               // defaulted
+              .slice_temporal_mvp_enabled_flag =
+                  seq_bits->sps_temporal_mvp_enabled_flag,
+              .slice_sao_luma_flag =
+                  seq_bits->sample_adaptive_offset_enabled_flag,
+              .slice_sao_chroma_flag =
+                  seq_bits->sample_adaptive_offset_enabled_flag,
+              .num_ref_idx_active_override_flag = 0,              // hardcoded
+              .mvd_l1_zero_flag = 0,                              // defaulted
+              .cabac_init_flag = 0,                               // defaulted
+              .slice_deblocking_filter_disabled_flag = 0,         // defaulted
+              .slice_loop_filter_across_slices_enabled_flag = 0,  // defaulted
+              .collocated_from_l0_flag = 0,                       // No B-frames
+          },
+
+      .pred_weight_table_bit_offset = 0,  // defaulted
+      .pred_weight_table_bit_length = 0,  // defaulted
+  };
+
+  for (size_t i = 0; i < LENGTH(encode_context->slice.ref_pic_list0); i++) {
+    encode_context->slice.ref_pic_list0[i] = (VAPictureHEVC){
+        .picture_id = VA_INVALID_ID,
+        .flags = VA_PICTURE_HEVC_INVALID,
+    };
+  }
+
+  for (size_t i = 0; i < LENGTH(encode_context->slice.ref_pic_list1); i++) {
+    encode_context->slice.ref_pic_list1[i] = (VAPictureHEVC){
+        .picture_id = VA_INVALID_ID,
+        .flags = VA_PICTURE_HEVC_INVALID,
+    };
+  }
+}
+
+struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
+                                          uint32_t width, uint32_t height,
+                                          enum YuvColorspace colorspace,
+                                          enum YuvRange range) {
+  struct EncodeContext* encode_context = malloc(sizeof(struct EncodeContext));
+  if (!encode_context) {
+    LOG("Faield to allocate encode context (%s)", strerror(errno));
     return NULL;
   }
 
-  int err = av_hwframe_get_buffer(encode_context->codec_context->hw_frames_ctx,
-                                  hw_frame, 0);
-  if (err < 0) {
-    LOG("Failed to get hwframe buffer (%s)", av_err2str(err));
-    goto rollback_hw_frame;
-  }
-  if (!hw_frame->hw_frames_ctx) {
-    LOG("Failed to ref hwframe context");
-    goto rollback_hw_frame;
+  *encode_context = (struct EncodeContext){
+      .gpu_context = gpu_context,
+      .width = width,
+      .height = height,
+      .colorspace = colorspace,
+      .range = range,
+  };
+
+  encode_context->render_node = open("/dev/dri/renderD128", O_RDWR);
+  if (encode_context->render_node == -1) {
+    LOG("Failed to open render node (%s)", strerror(errno));
+    goto rollback_encode_context;
   }
 
-  // mburakov: Roughly based on Sunshine code...
-  AVVAAPIDeviceContext* vaapi_device_context =
-      ((AVHWDeviceContext*)(void*)encode_context->hwdevice_context->data)
-          ->hwctx;
-  VASurfaceID surface_id = (VASurfaceID)(uintptr_t)hw_frame->data[3];
-  VADRMPRIMESurfaceDescriptor prime;
-  VAStatus status = vaExportSurfaceHandle(
-      vaapi_device_context->display, surface_id,
-      VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-      VA_EXPORT_SURFACE_WRITE_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS, &prime);
+  encode_context->va_display = vaGetDisplayDRM(encode_context->render_node);
+  if (!encode_context->va_display) {
+    LOG("Failed to get va display (%s)", strerror(errno));
+    goto rollback_render_node;
+  }
+
+  vaSetErrorCallback(encode_context->va_display, OnVaLogMessage, NULL);
+#ifndef NDEBUG
+  vaSetInfoCallback(encode_context->va_display, OnVaLogMessage, NULL);
+#endif  // NDEBUG
+
+  int major, minor;
+  VAStatus status = vaInitialize(encode_context->va_display, &major, &minor);
   if (status != VA_STATUS_SUCCESS) {
-    LOG("Failed to export vaapi surface (%d)", status);
-    goto rollback_hw_frame;
+    LOG("Failed to initialize va (%s)", VaErrorString(status));
+    goto rollback_va_display;
   }
 
-  struct GpuFrame* gpu_frame =
-      PrimeToGpuFrame(encode_context->gpu_context, &prime);
-  if (!gpu_frame) {
-    LOG("Failed to create gpu frame");
-    goto rollback_hw_frame;
+  LOG("Initialized VA %d.%d", major, minor);
+  // TODO(mburakov): Check entry points?
+
+  VAConfigAttrib attrib_list[] = {
+      {.type = VAConfigAttribRTFormat, .value = VA_RT_FORMAT_YUV420},
+  };
+  status = vaCreateConfig(encode_context->va_display, VAProfileHEVCMain,
+                          VAEntrypointEncSlice, attrib_list,
+                          LENGTH(attrib_list), &encode_context->va_config_id);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to create va config (%s)", VaErrorString(status));
+    goto rollback_va_display;
   }
 
-  encode_context->hw_frame = hw_frame;
-  encode_context->gpu_frame = gpu_frame;
-  return gpu_frame;
+  if (!InitializeCodecQuirks(encode_context)) {
+    LOG("Failed to initialize codec quirks");
+    goto rollback_va_config_id;
+  }
 
-rollback_hw_frame:
-  av_frame_free(&hw_frame);
+  // TODO(mburakov): ffmpeg attempts to deduce this.
+  static const uint32_t min_cb_size = 16;
+  uint32_t width_in_cb = (width + min_cb_size - 1) / min_cb_size;
+  uint32_t height_in_cb = (height + min_cb_size - 1) / min_cb_size;
+
+  // TODO(mburakov): ffmpeg attempts to deduce this.
+  static const uint32_t slice_block_size = 32;
+  uint32_t slice_block_rows =
+      (encode_context->width + slice_block_size - 1) / slice_block_size;
+  uint32_t slice_block_cols =
+      (encode_context->height + slice_block_size - 1) / slice_block_size;
+  uint32_t num_ctu_in_slice = slice_block_rows * slice_block_cols;
+
+  status = vaCreateContext(
+      encode_context->va_display, encode_context->va_config_id,
+      (int)(width_in_cb * min_cb_size), (int)(height_in_cb * min_cb_size),
+      VA_PROGRESSIVE, NULL, 0, &encode_context->va_context_id);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to create va context (%s)", VaErrorString(status));
+    goto rollback_va_config_id;
+  }
+
+  status =
+      vaCreateSurfaces(encode_context->va_display, VA_RT_FORMAT_YUV420, width,
+                       height, &encode_context->input_surface_id, 1, NULL, 0);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to create va input surface (%s)", VaErrorString(status));
+    goto rollback_va_context_id;
+  }
+
+  encode_context->gpu_frame = VaSurfaceToGpuFrame(
+      encode_context->va_display, encode_context->input_surface_id,
+      encode_context->gpu_context);
+  if (!encode_context->gpu_frame) {
+    LOG("Failed to convert va surface to gpu frame");
+    goto rollback_input_surface_id;
+  }
+
+  status =
+      vaCreateSurfaces(encode_context->va_display, VA_RT_FORMAT_YUV420,
+                       width_in_cb * min_cb_size, height_in_cb * min_cb_size,
+                       encode_context->recon_surface_ids,
+                       LENGTH(encode_context->recon_surface_ids), NULL, 0);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to create va recon surfaces (%s)", VaErrorString(status));
+    goto rollback_gpu_frame;
+  }
+
+  unsigned int max_encoded_size =
+      encode_context->width * encode_context->height * 3 / 2;
+  status =
+      vaCreateBuffer(encode_context->va_display, encode_context->va_context_id,
+                     VAEncCodedBufferType, max_encoded_size, 1, NULL,
+                     &encode_context->output_buffer_id);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to create va output buffer (%s)", VaErrorString(status));
+    goto rollback_recon_surface_ids;
+  }
+
+  InitializeSeqHeader(encode_context, (uint16_t)(width_in_cb * min_cb_size),
+                      (uint16_t)(height_in_cb * min_cb_size));
+  InitializePicHeader(encode_context);
+  InitializeSliceHeader(encode_context, num_ctu_in_slice);
+  return encode_context;
+
+rollback_recon_surface_ids:
+  vaDestroySurfaces(encode_context->va_display,
+                    encode_context->recon_surface_ids,
+                    LENGTH(encode_context->recon_surface_ids));
+rollback_gpu_frame:
+  GpuContextDestroyFrame(encode_context->gpu_context,
+                         encode_context->gpu_frame);
+rollback_input_surface_id:
+  vaDestroySurfaces(encode_context->va_display,
+                    &encode_context->input_surface_id, 1);
+rollback_va_context_id:
+  vaDestroyContext(encode_context->va_display, encode_context->va_config_id);
+rollback_va_config_id:
+  vaDestroyConfig(encode_context->va_display, encode_context->va_config_id);
+rollback_va_display:
+  vaTerminate(encode_context->va_display);
+rollback_render_node:
+  close(encode_context->render_node);
+rollback_encode_context:
+  free(encode_context);
   return NULL;
 }
 
-static bool DrainPacket(const struct AVPacket* packet, int fd) {
-  uint32_t size = (uint32_t)packet->size;
-  struct iovec iov[] = {
-      {.iov_base = &size, .iov_len = sizeof(size)},
-      {.iov_base = packet->data, .iov_len = (size_t)packet->size},
+const struct GpuFrame* EncodeContextGetFrame(
+    struct EncodeContext* encode_context) {
+  return encode_context->gpu_frame;
+}
+
+static bool UploadBuffer(const struct EncodeContext* encode_context,
+                         VABufferType va_buffer_type, unsigned int size,
+                         void* data, VABufferID** presult) {
+  VAStatus status =
+      vaCreateBuffer(encode_context->va_display, encode_context->va_context_id,
+                     va_buffer_type, size, 1, data, *presult);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to create buffer (%s)", VaErrorString(status));
+    return false;
+  }
+  (*presult)++;
+  return true;
+}
+
+static bool UploadPackedBuffer(const struct EncodeContext* encode_context,
+                               VAEncPackedHeaderType packed_header_type,
+                               unsigned int bit_length, void* data,
+                               VABufferID** presult) {
+  VAEncPackedHeaderParameterBuffer packed_header = {
+      .type = packed_header_type,
+      .bit_length = bit_length,
+      .has_emulation_bytes = 1,
   };
+  return UploadBuffer(encode_context, VAEncPackedHeaderParameterBufferType,
+                      sizeof(packed_header), &packed_header, presult) &&
+         UploadBuffer(encode_context, VAEncPackedHeaderDataBufferType,
+                      (bit_length + 7) / 8, data, presult);
+}
+
+static void UpdatePicHeader(struct EncodeContext* encode_context, bool idr) {
+  encode_context->pic.decoded_curr_pic = (VAPictureHEVC){
+      .picture_id =
+          encode_context
+              ->recon_surface_ids[encode_context->frame_counter %
+                                  LENGTH(encode_context->recon_surface_ids)],
+      .pic_order_cnt = (int32_t)(encode_context->frame_counter %
+                                 encode_context->seq.intra_idr_period),
+  };
+
+  if (idr) {
+    encode_context->pic.reference_frames[0] = (VAPictureHEVC){
+        .picture_id = VA_INVALID_ID,
+        .flags = VA_PICTURE_HEVC_INVALID,
+    };
+    encode_context->pic.nal_unit_type = IDR_W_RADL;
+    encode_context->pic.pic_fields.bits.idr_pic_flag = 1;
+    encode_context->pic.pic_fields.bits.coding_type = 1;
+  } else {
+    encode_context->pic.reference_frames[0] = (VAPictureHEVC){
+        .picture_id =
+            encode_context
+                ->recon_surface_ids[(encode_context->frame_counter - 1) %
+                                    LENGTH(encode_context->recon_surface_ids)],
+        .pic_order_cnt = (int32_t)((encode_context->frame_counter - 1) %
+                                   encode_context->seq.intra_idr_period),
+    };
+    encode_context->pic.nal_unit_type = TRAIL_R;
+    encode_context->pic.pic_fields.bits.idr_pic_flag = 0;
+    encode_context->pic.pic_fields.bits.coding_type = 2;
+  }
+}
+
+static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
   for (;;) {
-    ssize_t result = writev(fd, iov, LENGTH(iov));
+    ssize_t result = writev(fd, iovec, count);
     if (result < 0) {
       if (errno == EINTR) continue;
       LOG("Failed to write (%s)", strerror(errno));
       return false;
     }
-    for (size_t i = 0; i < LENGTH(iov); i++) {
-      size_t delta = MIN((size_t)result, iov[i].iov_len);
-      iov[i].iov_base = (uint8_t*)iov[i].iov_base + delta;
-      iov[i].iov_len -= delta;
+    for (int i = 0; i < count; i++) {
+      size_t delta = MIN((size_t)result, iovec[i].iov_len);
+      iovec[i].iov_base = (uint8_t*)iovec[i].iov_base + delta;
+      iovec[i].iov_len -= delta;
       result -= delta;
     }
     if (!result) return true;
@@ -264,59 +657,177 @@ static bool DrainPacket(const struct AVPacket* packet, int fd) {
 
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
   bool result = false;
-  if (encode_context->gpu_frame) {
-    GpuContextDestroyFrame(encode_context->gpu_context,
-                           encode_context->gpu_frame);
-    encode_context->gpu_frame = NULL;
-  }
-  AVPacket* packet = av_packet_alloc();
-  if (!packet) {
-    LOG("Failed to allocate packet (%s)", strerror(errno));
-    goto rollback_hw_frame;
+  VABufferID buffers[8];
+  VABufferID* buffer_ptr = buffers;
+
+  bool idr =
+      !(encode_context->frame_counter % encode_context->seq.intra_idr_period);
+  if (idr && !UploadBuffer(encode_context, VAEncSequenceParameterBufferType,
+                           sizeof(encode_context->seq), &encode_context->seq,
+                           &buffer_ptr)) {
+    LOG("Failed to upload sequence parameter buffer");
+    goto rollback_buffers;
   }
 
-  int err = avcodec_send_frame(encode_context->codec_context,
-                               encode_context->hw_frame);
-  if (err < 0) {
-    LOG("Failed to send frame (%s)", av_err2str(err));
-    goto rollback_packet;
+  if (encode_context->codec_quirks.packed_header_sequence && idr) {
+    char buffer[256];
+    struct Bitstream bitstream = {
+        .data = buffer,
+        .size = 0,
+    };
+
+    static const struct MoreVideoParameters mvp = {
+        .vps_max_dec_pic_buffering_minus1 = 1,  // No B-frames
+        .vps_max_num_reorder_pics = 0,          // No B-frames
+    };
+    uint32_t conf_win_right_offset_luma =
+        encode_context->seq.pic_width_in_luma_samples - encode_context->width;
+    uint32_t conf_win_bottom_offset_luma =
+        encode_context->seq.pic_height_in_luma_samples - encode_context->height;
+    const struct MoreSeqParameters msp = {
+        .conf_win_left_offset = 0,
+        .conf_win_right_offset = conf_win_right_offset_luma / 2,
+        .conf_win_top_offset = 0,
+        .conf_win_bottom_offset = conf_win_bottom_offset_luma / 2,
+        .sps_max_dec_pic_buffering_minus1 = 1,  // No B-frames
+        .sps_max_num_reorder_pics = 0,          // No B-frames
+        .video_signal_type_present_flag = 1,
+        .video_full_range_flag = encode_context->range == kFullRange,
+        .colour_description_present_flag = 1,
+        .colour_primaries = 2,          // Unsepcified
+        .transfer_characteristics = 2,  // Unspecified
+        .matrix_coeffs =
+            encode_context->colorspace == kItuRec601 ? 6 : 1,  // Table E.5
+    };
+
+    PackVideoParameterSetNalUnit(&bitstream, &encode_context->seq, &mvp);
+    PackSeqParameterSetNalUnit(&bitstream, &encode_context->seq, &msp);
+    PackPicParameterSetNalUnit(&bitstream, &encode_context->pic);
+    if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSequence,
+                            (unsigned int)bitstream.size, bitstream.data,
+                            &buffer_ptr)) {
+      LOG("Failed to upload packed sequence header");
+      goto rollback_buffers;
+    }
   }
 
-  err = avcodec_receive_packet(encode_context->codec_context, packet);
-  switch (err) {
-    case 0:
-      break;
-    case AVERROR(EAGAIN):
-      // TODO(mburakov): This happens only for the very first frame, and
-      // effectively introduces an additional latency of 16ms...
-      result = true;
-      goto rollback_packet;
-    default:
-      LOG("Failed to receive packet (%s)", av_err2str(err));
-      goto rollback_packet;
+  UpdatePicHeader(encode_context, idr);
+  if (!UploadBuffer(encode_context, VAEncPictureParameterBufferType,
+                    sizeof(encode_context->pic), &encode_context->pic,
+                    &buffer_ptr)) {
+    LOG("Failed to upload picture parameter buffer");
+    goto rollback_buffers;
   }
 
-  result = DrainPacket(packet, fd);
-  av_packet_unref(packet);
-  if (!result) {
-    LOG("Failed to drain packet");
-    goto rollback_packet;
+  encode_context->slice.slice_type = idr ? I : P;
+  encode_context->slice.ref_pic_list0[0] =
+      encode_context->pic.reference_frames[0];
+  if (encode_context->codec_quirks.packed_header_slice) {
+    char buffer[256];
+    struct Bitstream bitstream = {
+        .data = buffer,
+        .size = 0,
+    };
+    static const struct NegativePics negative_pics[] = {
+        {
+            .delta_poc_s0_minus1 = 0,
+            .used_by_curr_pic_s0_flag = true,
+        },
+    };
+    const struct MoreSliceParamerters msp = {
+        .first_slice_segment_in_pic_flag = 1,
+        .num_negative_pics = idr ? 0 : LENGTH(negative_pics),
+        .negative_pics = idr ? NULL : negative_pics,
+    };
+    PackSliceSegmentHeaderNalUnit(&bitstream, &encode_context->seq,
+                                  &encode_context->pic, &encode_context->slice,
+                                  &msp);
+    if (!UploadPackedBuffer(encode_context, VAEncPackedHeaderSlice,
+                            (unsigned int)bitstream.size, bitstream.data,
+                            &buffer_ptr)) {
+      LOG("Failed to upload packed sequence header");
+      goto rollback_buffers;
+    }
   }
 
-rollback_packet:
-  av_packet_free(&packet);
-rollback_hw_frame:
-  av_frame_free(&encode_context->hw_frame);
+  if (!UploadBuffer(encode_context, VAEncSliceParameterBufferType,
+                    sizeof(encode_context->slice), &encode_context->slice,
+                    &buffer_ptr)) {
+    LOG("Failed to upload slice parameter buffer");
+    goto rollback_buffers;
+  }
+
+  VAStatus status =
+      vaBeginPicture(encode_context->va_display, encode_context->va_context_id,
+                     encode_context->input_surface_id);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to begin va picture (%s)", VaErrorString(status));
+    goto rollback_buffers;
+  }
+
+  int num_buffers = (int)(buffer_ptr - buffers);
+  status = vaRenderPicture(encode_context->va_display,
+                           encode_context->va_context_id, buffers, num_buffers);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to render va picture (%s)", VaErrorString(status));
+    goto rollback_buffers;
+  }
+
+  status =
+      vaEndPicture(encode_context->va_display, encode_context->va_context_id);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to end va picture (%s)", VaErrorString(status));
+    goto rollback_buffers;
+  }
+
+  status = vaSyncBuffer(encode_context->va_display,
+                        encode_context->output_buffer_id, VA_TIMEOUT_INFINITE);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to sync va buffer (%s)", VaErrorString(status));
+    goto rollback_buffers;
+  }
+
+  VACodedBufferSegment* segment;
+  status = vaMapBuffer(encode_context->va_display,
+                       encode_context->output_buffer_id, (void**)&segment);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to map va buffer (%s)", VaErrorString(status));
+    goto rollback_buffers;
+  }
+  if (segment->next != NULL) {
+    LOG("Next segment non-null!");
+    abort();
+  }
+
+  struct iovec iovec[] = {
+      {.iov_base = &segment->size, .iov_len = sizeof(segment->size)},
+      {.iov_base = segment->buf, .iov_len = segment->size},
+  };
+  if (!DrainBuffers(fd, iovec, LENGTH(iovec))) {
+    LOG("Failed to drain encoded frame");
+    goto rollback_segment;
+  }
+
+  encode_context->frame_counter++;
+  result = true;
+
+rollback_segment:
+  vaUnmapBuffer(encode_context->va_display, encode_context->output_buffer_id);
+rollback_buffers:
+  while (buffer_ptr-- > buffers)
+    vaDestroyBuffer(encode_context->va_display, *buffer_ptr);
   return result;
 }
 
 void EncodeContextDestroy(struct EncodeContext* encode_context) {
-  if (encode_context->gpu_frame) {
-    GpuContextDestroyFrame(encode_context->gpu_context,
-                           encode_context->gpu_frame);
-  }
-  if (encode_context->hw_frame) av_frame_free(&encode_context->hw_frame);
-  avcodec_free_context(&encode_context->codec_context);
-  av_buffer_unref(&encode_context->hwdevice_context);
+  vaDestroyBuffer(encode_context->va_display, encode_context->output_buffer_id);
+  GpuContextDestroyFrame(encode_context->gpu_context,
+                         encode_context->gpu_frame);
+  vaDestroySurfaces(encode_context->va_display,
+                    &encode_context->input_surface_id, 1);
+  vaDestroyContext(encode_context->va_display, encode_context->va_context_id);
+  vaDestroyConfig(encode_context->va_display, encode_context->va_config_id);
+  vaTerminate(encode_context->va_display);
+  close(encode_context->render_node);
   free(encode_context);
 }
