@@ -1,6 +1,6 @@
 # Streamer
 
-This is a lightweight framebuffer streamer. It continuously captures framebuffer with 60 fps rate, converts it into YUV colorspace using GLSL shader, compresses resulting buffers into HEVC bitstream using VA-API libavcodec backend, and sends the resulting bitstream to a connected client over tcp connection. Everything is done hardware-accelerated and zero-copy. Streamer receives input events from a connected client over the same tcp connection, and forwards those to kernel using uhid api. This streaming server is accompanied by a lightweight [receiver](https://github.com/mburakov/receiver) client.
+This is a lightweight framebuffer streamer. It continuously captures framebuffer with 60 fps rate, converts it into YUV colorspace using GLSL shader, compresses resulting buffers into HEVC bitstream using VA-API, and sends the resulting bitstream to a connected client over tcp connection. Everything is done hardware-accelerated and zero-copy. Streamer receives input events from a connected client over the same tcp connection, and forwards those to kernel using uhid api. This streaming server is accompanied by a lightweight [receiver](https://burakov.eu/receiver.git) client.
 
 ## Building on Linux
 
@@ -8,10 +8,9 @@ Streamer depends on following libraries:
 * egl
 * gbm
 * glesv2
-* libavcodec
-* libavutil
 * libdrm
 * libva
+* libva-drm
 
 Once you have these installed, just
 ```
@@ -24,14 +23,14 @@ I don't care about any other platforms except Linux, so you are on your own. Mor
 
 ## Running
 
-There are couple of things streamer implies. I.e. that the system supports KMS and that it's actually possible to access framebuffers via libdrm. This is certainly the case with Intel and AMD when using opensource drivers. This is certainly not the case with Nvidia and proprietary drivers. Same stands for hardware-accelerated colorspace conversion. I don't really expect Nvidia to support [EGL_EXT_image_dma_buf_import](https://registry.khronos.org/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import.txt) and related infrastructure. Hardware-accelerated video decoding is achieved by means of libavcodec and VA-API, and Nvidia does not support the latter. I guess you got the point already - no Nvidia please.
+There are couple of things streamer implies. I.e. that the system supports KMS and that it's actually possible to access framebuffers via libdrm. This is certainly the case with Intel and AMD when using opensource drivers. This is certainly not the case with Nvidia and proprietary drivers. Same stands for hardware-accelerated colorspace conversion. I don't really expect Nvidia to support [EGL_EXT_image_dma_buf_import](https://registry.khronos.org/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import.txt) and related infrastructure. Hardware-accelerated video encoding is achieved by means of VA-API, and Nvidia does not support the latter. I guess you got the point already - no Nvidia please.
 
 Since streamer requires read access to framebuffer and read-write access to uhid device, it is recommended to run it as root. Provide listening port number on commandline as a single argument:
 ```
 sudo ./streamer 1337
 ```
 
-After starting, streamer would wait for incoming connections from [receiver](https://github.com/mburakov/receiver) on the specified port. Streamer does not do capturing until receiver is conencted.
+After starting, streamer would wait for incoming connections from [receiver](https://burakov.eu/receiver.git) on the specified port. Streamer does not do capturing until receiver is conencted.
 
 ## What about Steam Link?
 
@@ -59,7 +58,7 @@ This is correct, audio streaming is not supported as of today. Actually pulseaud
 
 ## Fancy features support status
 
-There are no fancy features in streamer. There's no bitrate control - libavcodec configuration selects constant image quality over constant bitrate. There's no frame pacing - because I personally consider it useless for low-latency realtime streaming. There's no network discovery. There's no automatic reconnection. There's no codec selection. There's no fancy configuration interface. There are no options at all. I might consider implementing some of that in the future - or might not, because it works perfectly fine for my use-case in its current state.
+There are no fancy features in streamer. There's no bitrate control - VA-API configuration selects constant image quality over constant bitrate. There's no frame pacing - because I personally consider it useless for low-latency realtime streaming. There's no network discovery. There's no automatic reconnection. There's no codec selection. There's no fancy configuration interface. There are no options at all. I might consider implementing some of that in the future - or might not, because it works perfectly fine for my use-case in its current state.
 
 At the same time, it addresses all of the issues listed above for Steam Link and Sunshine/Moonlight. No issues with controls, no issue with video quality, no issues with screen capturing. On top of that instant startup and shutdown both on server- and client-side.
 
