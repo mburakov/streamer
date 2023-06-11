@@ -32,6 +32,7 @@
 #include "bitstream.h"
 #include "gpu.h"
 #include "hevc.h"
+#include "proto.h"
 #include "toolbox/utils.h"
 
 struct EncodeContext {
@@ -922,8 +923,14 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
     abort();
   }
 
+  struct Proto proto = {
+      .size = segment->size,
+      .type = PROTO_TYPE_VIDEO,
+      .flags = idr ? PROTO_FLAG_KEYFRAME : 0,
+      .latency = 0,
+  };
   struct iovec iovec[] = {
-      {.iov_base = &segment->size, .iov_len = sizeof(segment->size)},
+      {.iov_base = &proto, .iov_len = sizeof(proto)},
       {.iov_base = segment->buf, .iov_len = segment->size},
   };
   if (!DrainBuffers(fd, iovec, LENGTH(iovec))) {
