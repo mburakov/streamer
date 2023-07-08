@@ -21,11 +21,13 @@
 #include <fcntl.h>
 #include <linux/uhid.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include "proto.h"
 #include "toolbox/buffer.h"
 #include "toolbox/utils.h"
 
@@ -88,6 +90,26 @@ bool InputHandlerHandle(struct InputHandler* input_handler, int fd) {
     if (input_handler->buffer.size < sizeof(event->type)) {
       // mburakov: Packet type is not yet available.
       return true;
+    }
+
+    if (event->type == ~0u) {
+      // mburakov: Special case, a ping message.
+      size_t size = sizeof(event->type) + sizeof(uint64_t);
+      if (input_handler->buffer.size < size) {
+        // mburakov: Payload of ping message is not yet available.
+        return true;
+      }
+      char buffer[sizeof(struct Proto) + sizeof(uint64_t)];
+      struct Proto* proto = (void*)buffer;
+      proto->size = sizeof(uint64_t);
+      proto->type = PROTO_TYPE_MISC;
+      memcpy(proto->data, &event->u, sizeof(uint64_t));
+      if (write(fd, buffer, sizeof(buffer)) != sizeof(buffer)) {
+        LOG("Failed to write pong message (%s)", strerror(errno));
+        return false;
+      }
+      BufferDiscard(&input_handler->buffer, size);
+      continue;
     }
 
     size_t size;
