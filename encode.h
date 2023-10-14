@@ -33,7 +33,8 @@ struct EncodeContext* EncodeContextCreate(struct GpuContext* gpu_context,
                                           enum YuvRange range);
 const struct GpuFrame* EncodeContextGetFrame(
     struct EncodeContext* encode_context);
-bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd);
+bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
+                              unsigned long long timestamp);
 void EncodeContextDestroy(struct EncodeContext* encode_context);
 
 #endif  // STREAMER_ENCODE_H_

@@ -4,7 +4,8 @@ obj:=$(src:.c=.o)
 
 obj+=\
 	toolbox/buffer.o \
-	toolbox/io_muxer.o
+	toolbox/io_muxer.o \
+	toolbox/perf.o
 
 libs:=\
 	egl \

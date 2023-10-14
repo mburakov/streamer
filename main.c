@@ -32,6 +32,7 @@
 #include "gpu.h"
 #include "input.h"
 #include "toolbox/io_muxer.h"
+#include "toolbox/perf.h"
 #include "toolbox/utils.h"
 
 // TODO(mburakov): Currently zwp_linux_dmabuf_v1 has no way to provide
@@ -135,6 +136,7 @@ static void OnTimerExpire(void* user) {
     return;
   }
 
+  unsigned long long timestamp = MicrosNow();
   const struct GpuFrame* captured_frame =
       CaptureContextGetFrame(contexts->capture_context);
   if (!captured_frame) {
@@ -163,8 +165,8 @@ static void OnTimerExpire(void* user) {
     LOG("Failed to convert frame");
     goto drop_client;
   }
-  if (!EncodeContextEncodeFrame(contexts->encode_context,
-                                contexts->client_fd)) {
+  if (!EncodeContextEncodeFrame(contexts->encode_context, contexts->client_fd,
+                                timestamp)) {
     LOG("Failed to encode frame");
     goto drop_client;
   }

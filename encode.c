@@ -33,6 +33,7 @@
 #include "gpu.h"
 #include "hevc.h"
 #include "proto.h"
+#include "toolbox/perf.h"
 #include "toolbox/utils.h"
 
 struct EncodeContext {
@@ -778,7 +779,8 @@ static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
   }
 }
 
-bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
+bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
+                              unsigned long long timestamp) {
   bool result = false;
   VABufferID buffers[8];
   VABufferID* buffer_ptr = buffers;
@@ -927,7 +929,7 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd) {
       .size = segment->size,
       .type = PROTO_TYPE_VIDEO,
       .flags = idr ? PROTO_FLAG_KEYFRAME : 0,
-      .latency = 0,
+      .latency = (uint16_t)(MicrosNow() - timestamp),
   };
   struct iovec iovec[] = {
       {.iov_base = &proto, .iov_len = sizeof(proto)},
