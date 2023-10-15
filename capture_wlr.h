@@ -15,24 +15,25 @@
  * along with streamer.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef STREAMER_CAPTURE_H_
-#define STREAMER_CAPTURE_H_
+#ifndef STREAMER_CAPTURE_WLR_H_
+#define STREAMER_CAPTURE_WLR_H_
 
-#include <stdbool.h>
+#include "capture.h"
 
-struct CaptureContext;
-struct GpuContext;
-struct GpuFrame;
+struct CaptureContextWlr;
 
-struct CaptureContextCallbacks {
-  void (*OnFrameReady)(void* user, const struct GpuFrame* gpu_frame);
-};
-
-struct CaptureContext* CaptureContextCreate(
+#ifdef USE_WAYLAND
+struct CaptureContextWlr* CaptureContextWlrCreate(
     struct GpuContext* gpu_context,
     const struct CaptureContextCallbacks* callbacks, void* user);
-int CaptureContextGetEventsFd(struct CaptureContext* capture_context);
-bool CaptureContextProcessEvents(struct CaptureContext* capture_context);
-void CaptureContextDestroy(struct CaptureContext* capture_context);
+int CaptureContextWlrGetEventsFd(struct CaptureContextWlr* capture_context);
+bool CaptureContextWlrProcessEvents(struct CaptureContextWlr* capture_context);
+void CaptureContextWlrDestroy(struct CaptureContextWlr* capture_context);
+#else  // USE_WAYLAND
+#define CaptureContextWlrCreate(...) NULL
+#define CaptureContextWlrGetEventsFd(...) -1
+#define CaptureContextWlrProcessEvents(...) false
+#define CaptureContextWlrDestroy(...)
+#endif  // USE_WAYLAND
 
-#endif  // STREAMER_CAPTURE_H_
+#endif  // STREAMER_CAPTURE_WLR_H_

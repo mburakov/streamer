@@ -22,8 +22,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/timerfd.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "capture.h"
@@ -41,20 +39,18 @@
 // https://gitlab.freedesktop.org/wayland/wayland-protocols/-/merge_requests/183
 static const enum YuvColorspace colorspace = kItuRec601;
 static const enum YuvRange range = kNarrowRange;
-static const int capture_period = 1000000000 / 60;
 
 static volatile sig_atomic_t g_signal;
 static void OnSignal(int status) { g_signal = status; }
 
 struct Contexts {
-  struct IoMuxer io_muxer;
-  int timer_fd;
-  int server_fd;
   struct GpuContext* gpu_context;
-  struct CaptureContext* capture_context;
+  struct IoMuxer io_muxer;
+  int server_fd;
 
   int client_fd;
   struct InputHandler* input_handler;
+  struct CaptureContext* capture_context;
   struct EncodeContext* encode_context;
 };
 
@@ -93,10 +89,13 @@ rollback_sock:
 }
 
 static void MaybeDropClient(struct Contexts* contexts) {
-  static const struct itimerspec spec = {0};
   if (contexts->encode_context) {
     EncodeContextDestroy(contexts->encode_context);
     contexts->encode_context = NULL;
+  }
+  if (contexts->capture_context) {
+    CaptureContextDestroy(contexts->capture_context);
+    contexts->capture_context = NULL;
   }
   if (contexts->input_handler) {
     IoMuxerForget(&contexts->io_muxer,
@@ -111,38 +110,10 @@ static void MaybeDropClient(struct Contexts* contexts) {
   }
 }
 
-static void OnTimerExpire(void* user) {
+static void OnCaptureContextFrameReady(void* user,
+                                       const struct GpuFrame* captured_frame) {
   struct Contexts* contexts = user;
-  if (!IoMuxerOnRead(&contexts->io_muxer, contexts->timer_fd, &OnTimerExpire,
-                     user)) {
-    LOG("Failed to reschedule timer (%s)", strerror(errno));
-    g_signal = SIGABRT;
-    return;
-  }
-  uint64_t expirations;
-  if (read(contexts->timer_fd, &expirations, sizeof(expirations)) !=
-      sizeof(expirations)) {
-    LOG("Failed to read timer expirations (%s)", strerror(errno));
-    g_signal = SIGABRT;
-    return;
-  }
-  if (contexts->client_fd == -1) {
-    // mburakov: Timer must disarm itself AFTER reading.
-    static const struct itimerspec spec = {0};
-    if (timerfd_settime(contexts->timer_fd, 0, &spec, NULL)) {
-      LOG("Failed to disarm timer (%s)", strerror(errno));
-      g_signal = SIGABRT;
-    }
-    return;
-  }
-
   unsigned long long timestamp = MicrosNow();
-  const struct GpuFrame* captured_frame =
-      CaptureContextGetFrame(contexts->capture_context);
-  if (!captured_frame) {
-    LOG("Failed to capture frame");
-    goto drop_client;
-  }
 
   if (!contexts->encode_context) {
     contexts->encode_context =
@@ -198,11 +169,29 @@ static void OnInputEvents(void* user) {
   if (!IoMuxerOnRead(&contexts->io_muxer,
                      InputHandlerGetEventsFd(contexts->input_handler),
                      &OnInputEvents, user)) {
-    LOG("Failed to reschedule events reading (%s)", strerror(errno));
+    LOG("Failed to reschedule input events reading (%s)", strerror(errno));
     goto drop_client;
   }
   if (!InputHandlerProcessEvents(contexts->input_handler)) {
-    LOG("Failed to process events");
+    LOG("Failed to process input events");
+    goto drop_client;
+  }
+  return;
+
+drop_client:
+  MaybeDropClient(contexts);
+}
+
+static void OnCaptureContextEvents(void* user) {
+  struct Contexts* contexts = user;
+  if (!IoMuxerOnRead(&contexts->io_muxer,
+                     CaptureContextGetEventsFd(contexts->capture_context),
+                     &OnCaptureContextEvents, user)) {
+    LOG("Failed to reschedule capture events reading (%s)", strerror(errno));
+    goto drop_client;
+  }
+  if (!CaptureContextProcessEvents(contexts->capture_context)) {
+    LOG("Failed to process capture events");
     goto drop_client;
   }
   return;
@@ -246,15 +235,22 @@ static void OnClientConnecting(void* user) {
   if (!IoMuxerOnRead(&contexts->io_muxer,
                      InputHandlerGetEventsFd(contexts->input_handler),
                      &OnInputEvents, user)) {
-    LOG("Failed to schedule events reading (%s)", strerror(errno));
+    LOG("Failed to schedule input events reading (%s)", strerror(errno));
     goto drop_client;
   }
-  static const struct itimerspec spec = {
-      .it_interval.tv_nsec = capture_period,
-      .it_value.tv_nsec = capture_period,
+  static const struct CaptureContextCallbacks kCaptureContextCallbacks = {
+      .OnFrameReady = OnCaptureContextFrameReady,
   };
-  if (timerfd_settime(contexts->timer_fd, 0, &spec, NULL)) {
-    LOG("Failed to arm timer (%s)", strerror(errno));
+  contexts->capture_context = CaptureContextCreate(
+      contexts->gpu_context, &kCaptureContextCallbacks, user);
+  if (!contexts->capture_context) {
+    LOG("Failed to create capture context");
+    goto drop_client;
+  }
+  if (!IoMuxerOnRead(&contexts->io_muxer,
+                     CaptureContextGetEventsFd(contexts->capture_context),
+                     &OnCaptureContextEvents, user)) {
+    LOG("Failed to schedule capture events reading (%s)", strerror(errno));
     goto drop_client;
   }
   return;
@@ -276,41 +272,24 @@ int main(int argc, char* argv[]) {
   }
 
   struct Contexts contexts = {
-      .timer_fd = -1,
       .server_fd = -1,
       .client_fd = -1,
   };
+  contexts.gpu_context = GpuContextCreate(colorspace, range);
+  if (!contexts.gpu_context) {
+    LOG("Failed to create gpu context");
+    return EXIT_FAILURE;
+  }
   IoMuxerCreate(&contexts.io_muxer);
   contexts.server_fd = CreateServerSocket(argv[1]);
   if (contexts.server_fd == -1) {
     LOG("Failed to create server socket");
     goto rollback_io_muxer;
   }
-  contexts.timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
-  if (contexts.timer_fd == -1) {
-    LOG("Failed to create timer (%s)", strerror(errno));
-    goto rollback_server_fd;
-  }
-  contexts.gpu_context = GpuContextCreate(colorspace, range);
-  if (!contexts.gpu_context) {
-    LOG("Failed to create gpu context");
-    goto rollback_timer_fd;
-  }
-  contexts.capture_context = CaptureContextCreate(contexts.gpu_context);
-  if (!contexts.capture_context) {
-    LOG("Failed to create capture context");
-    goto rollback_gpu_context;
-  }
-
-  if (!IoMuxerOnRead(&contexts.io_muxer, contexts.timer_fd, &OnTimerExpire,
-                     &contexts)) {
-    LOG("Failed to schedule timer (%s)", strerror(errno));
-    goto rollback_capture_context;
-  }
   if (!IoMuxerOnRead(&contexts.io_muxer, contexts.server_fd,
                      &OnClientConnecting, &contexts)) {
     LOG("Failed to schedule accept (%s)", strerror(errno));
-    goto rollback_capture_context;
+    goto rollback_server_fd;
   }
   while (!g_signal) {
     if (IoMuxerIterate(&contexts.io_muxer, -1) && errno != EINTR) {
@@ -320,16 +299,11 @@ int main(int argc, char* argv[]) {
   }
   MaybeDropClient(&contexts);
 
-rollback_capture_context:
-  CaptureContextDestroy(contexts.capture_context);
-rollback_gpu_context:
-  GpuContextDestroy(contexts.gpu_context);
-rollback_timer_fd:
-  close(contexts.timer_fd);
 rollback_server_fd:
   close(contexts.server_fd);
 rollback_io_muxer:
   IoMuxerDestroy(&contexts.io_muxer);
+  GpuContextDestroy(contexts.gpu_context);
   bool result = g_signal == SIGINT || g_signal == SIGTERM;
   return result ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -15,24 +15,18 @@
  * along with streamer.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef STREAMER_CAPTURE_H_
-#define STREAMER_CAPTURE_H_
+#ifndef STREAMER_CAPTURE_KMS_H_
+#define STREAMER_CAPTURE_KMS_H_
 
-#include <stdbool.h>
+#include "capture.h"
 
-struct CaptureContext;
-struct GpuContext;
-struct GpuFrame;
+struct CaptureContextKms;
 
-struct CaptureContextCallbacks {
-  void (*OnFrameReady)(void* user, const struct GpuFrame* gpu_frame);
-};
-
-struct CaptureContext* CaptureContextCreate(
+struct CaptureContextKms* CaptureContextKmsCreate(
     struct GpuContext* gpu_context,
     const struct CaptureContextCallbacks* callbacks, void* user);
-int CaptureContextGetEventsFd(struct CaptureContext* capture_context);
-bool CaptureContextProcessEvents(struct CaptureContext* capture_context);
-void CaptureContextDestroy(struct CaptureContext* capture_context);
+int CaptureContextKmsGetEventsFd(struct CaptureContextKms* capture_context);
+bool CaptureContextKmsProcessEvents(struct CaptureContextKms* capture_context);
+void CaptureContextKmsDestroy(struct CaptureContextKms* capture_context);
 
-#endif  // STREAMER_CAPTURE_H_
+#endif  // STREAMER_CAPTURE_KMS_H_

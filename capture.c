@@ -17,174 +17,61 @@
 
 #include "capture.h"
 
-#include <assert.h>
 #include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <xf86drm.h>
 
-#include "gpu.h"
+#include "capture_kms.h"
+#include "capture_wlr.h"
 #include "toolbox/utils.h"
 
 struct CaptureContext {
-  struct GpuContext* gpu_context;
-  int drm_fd;
-  uint32_t crtc_id;
-  struct GpuFrame* gpu_frame;
+  struct CaptureContextKms* kms;
+  struct CaptureContextWlr* wlr;
 };
 
-static int OpenAnyModule(void) {
-  static const char* const modules[] = {
-      "i915",      "amdgpu",     "radeon",     "nouveau",     "vmwgfx",
-      "omapdrm",   "exynos",     "tilcdc",     "msm",         "sti",
-      "tegra",     "imx-drm",    "rockchip",   "atmel-hlcdc", "fsl-dcu-drm",
-      "vc4",       "virtio_gpu", "mediatek",   "meson",       "pl111",
-      "stm",       "sun4i-drm",  "armada-drm", "komeda",      "imx-dcss",
-      "mxsfb-drm", "simpledrm",  "imx-lcdif",  "vkms",
-  };
-  for (size_t i = 0; i < LENGTH(modules); i++) {
-    int drm_fd = drmOpen(modules[i], NULL);
-    if (drm_fd >= 0) return drm_fd;
-    LOG("Failed to open %s (%s)", modules[i], strerror(errno));
-  }
-  return -1;
-}
-
-static bool GetCrtcFb(int drm_fd, uint32_t crtc_id,
-                      struct drm_mode_fb_cmd2* drm_mode_fb_cmd2) {
-  struct drm_mode_crtc drm_mode_crtc = {
-      .crtc_id = crtc_id,
-  };
-  if (drmIoctl(drm_fd, DRM_IOCTL_MODE_GETCRTC, &drm_mode_crtc)) {
-    LOG("Failed to get crtc %u (%s)", crtc_id, strerror(errno));
-    return false;
-  }
-  if (!drm_mode_crtc.fb_id) {
-    LOG("Crtc %u has no framebuffer", crtc_id);
-    return false;
-  }
-
-  struct drm_mode_fb_cmd2 result = {
-      .fb_id = drm_mode_crtc.fb_id,
-  };
-  if (drmIoctl(drm_fd, DRM_IOCTL_MODE_GETFB2, &result)) {
-    LOG("Failed to get framebuffer %u (%s)", drm_mode_crtc.fb_id,
-        strerror(errno));
-    return false;
-  }
-  if (!result.handles[0]) {
-    LOG("Framebuffer %u has no handles", drm_mode_crtc.fb_id);
-    return false;
-  }
-
-  if (drm_mode_fb_cmd2) *drm_mode_fb_cmd2 = result;
-  return true;
-}
-
-struct CaptureContext* CaptureContextCreate(struct GpuContext* gpu_context) {
+struct CaptureContext* CaptureContextCreate(
+    struct GpuContext* gpu_context,
+    const struct CaptureContextCallbacks* callbacks, void* user) {
   struct CaptureContext* capture_context =
-      malloc(sizeof(struct CaptureContext));
+      calloc(1, sizeof(struct CaptureContext));
   if (!capture_context) {
     LOG("Failed to allocate capture context (%s)", strerror(errno));
     return NULL;
   }
-  *capture_context = (struct CaptureContext){
-      .gpu_context = gpu_context,
-      .drm_fd = -1,
-  };
 
-  capture_context->drm_fd = OpenAnyModule();
-  if (capture_context->drm_fd == -1) {
-    LOG("Failed to open any module");
-    goto rollback_capture_context;
-  }
+  capture_context->kms = CaptureContextKmsCreate(gpu_context, callbacks, user);
+  if (capture_context->kms) return capture_context;
 
-  uint32_t crtc_ids[16];
-  struct drm_mode_card_res drm_mode_card_res = {
-      .crtc_id_ptr = (uintptr_t)crtc_ids,
-      .count_crtcs = LENGTH(crtc_ids),
-  };
-  if (drmIoctl(capture_context->drm_fd, DRM_IOCTL_MODE_GETRESOURCES,
-               &drm_mode_card_res)) {
-    LOG("Failed to get drm mode resources (%s)", strerror(errno));
-    goto rollback_drm_fd;
-  }
-  for (size_t i = 0; i < drm_mode_card_res.count_crtcs; i++) {
-    if (GetCrtcFb(capture_context->drm_fd, crtc_ids[i], NULL)) {
-      LOG("Capturing crtc %u", crtc_ids[i]);
-      capture_context->crtc_id = crtc_ids[i];
-      return capture_context;
-    }
-  }
-  LOG("Nothing to capture");
+  LOG("Failed to create kms capture context");
+  capture_context->wlr = CaptureContextWlrCreate(gpu_context, callbacks, user);
+  if (capture_context->wlr) return capture_context;
 
-rollback_drm_fd:
-  drmClose(capture_context->drm_fd);
-rollback_capture_context:
+  LOG("Failed to create wlr capture context");
   free(capture_context);
   return NULL;
 }
 
-const struct GpuFrame* CaptureContextGetFrame(
-    struct CaptureContext* capture_context) {
-  struct drm_mode_fb_cmd2 drm_mode_fb_cmd2;
-  if (!GetCrtcFb(capture_context->drm_fd, capture_context->crtc_id,
-                 &drm_mode_fb_cmd2))
-    return NULL;
+int CaptureContextGetEventsFd(struct CaptureContext* capture_context) {
+  if (capture_context->kms)
+    return CaptureContextKmsGetEventsFd(capture_context->kms);
+  if (capture_context->wlr)
+    return CaptureContextWlrGetEventsFd(capture_context->wlr);
+  return -1;
+}
 
-  if (capture_context->gpu_frame) {
-    GpuContextDestroyFrame(capture_context->gpu_context,
-                           capture_context->gpu_frame);
-    capture_context->gpu_frame = NULL;
-  }
-
-  struct GpuFramePlane planes[] = {
-      {.dmabuf_fd = -1},
-      {.dmabuf_fd = -1},
-      {.dmabuf_fd = -1},
-      {.dmabuf_fd = -1},
-  };
-  static_assert(LENGTH(planes) == LENGTH(drm_mode_fb_cmd2.handles),
-                "Suspicious drm_mode_fb_cmd2 structure");
-
-  size_t nplanes = 0;
-  for (; nplanes < LENGTH(planes); nplanes++) {
-    if (!drm_mode_fb_cmd2.handles[nplanes]) break;
-    int status = drmPrimeHandleToFD(capture_context->drm_fd,
-                                    drm_mode_fb_cmd2.handles[nplanes], 0,
-                                    &planes[nplanes].dmabuf_fd);
-    if (status) {
-      LOG("Failed to get dmabuf fd (%d)", status);
-      goto release_planes;
-    }
-    planes[nplanes].offset = drm_mode_fb_cmd2.offsets[nplanes];
-    planes[nplanes].pitch = drm_mode_fb_cmd2.pitches[nplanes];
-    planes[nplanes].modifier = drm_mode_fb_cmd2.modifier[nplanes];
-  }
-
-  capture_context->gpu_frame = GpuContextCreateFrame(
-      capture_context->gpu_context, drm_mode_fb_cmd2.width,
-      drm_mode_fb_cmd2.height, drm_mode_fb_cmd2.pixel_format, nplanes, planes);
-  if (!capture_context->gpu_frame) {
-    LOG("Failed to create gpu frame");
-    goto release_planes;
-  }
-  return capture_context->gpu_frame;
-
-release_planes:
-  CloseUniqueFds((int[]){planes[0].dmabuf_fd, planes[1].dmabuf_fd,
-                         planes[2].dmabuf_fd, planes[3].dmabuf_fd});
-  return NULL;
+bool CaptureContextProcessEvents(struct CaptureContext* capture_context) {
+  if (capture_context->kms)
+    return CaptureContextKmsProcessEvents(capture_context->kms);
+  if (capture_context->wlr)
+    return CaptureContextWlrProcessEvents(capture_context->wlr);
+  return false;
 }
 
 void CaptureContextDestroy(struct CaptureContext* capture_context) {
-  if (capture_context->gpu_frame) {
-    GpuContextDestroyFrame(capture_context->gpu_context,
-                           capture_context->gpu_frame);
-  }
-  drmClose(capture_context->drm_fd);
+  if (capture_context->wlr) CaptureContextWlrDestroy(capture_context->wlr);
+  if (capture_context->kms) CaptureContextKmsDestroy(capture_context->kms);
   free(capture_context);
 }
