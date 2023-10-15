@@ -52,6 +52,7 @@ struct Contexts {
   struct InputHandler* input_handler;
   struct CaptureContext* capture_context;
   struct EncodeContext* encode_context;
+  bool drop_client;
 };
 
 static int CreateServerSocket(const char* arg) {
@@ -144,7 +145,10 @@ static void OnCaptureContextFrameReady(void* user,
   return;
 
 drop_client:
-  MaybeDropClient(contexts);
+  // TODO(mburakov): Can't drop client here, because leftover code in capturing
+  // functions would fail in this case. Instead just schedule dropping client
+  // here, and execute that in the event loop of the main function.
+  contexts->drop_client = true;
 }
 
 static void OnClientWriting(void* user) {
@@ -295,6 +299,10 @@ int main(int argc, char* argv[]) {
     if (IoMuxerIterate(&contexts.io_muxer, -1) && errno != EINTR) {
       LOG("Failed to iterate io muxer (%s)", strerror(errno));
       g_signal = SIGABRT;
+    }
+    if (contexts.drop_client) {
+      MaybeDropClient(&contexts);
+      contexts.drop_client = false;
     }
   }
   MaybeDropClient(&contexts);
