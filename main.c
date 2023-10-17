@@ -44,6 +44,7 @@ static volatile sig_atomic_t g_signal;
 static void OnSignal(int status) { g_signal = status; }
 
 struct Contexts {
+  bool disable_uhid;
   struct GpuContext* gpu_context;
   struct IoMuxer io_muxer;
   int server_fd;
@@ -231,7 +232,7 @@ static void OnClientConnecting(void* user) {
     LOG("Failed to schedule client reading (%s)", strerror(errno));
     goto drop_client;
   }
-  contexts->input_handler = InputHandlerCreate();
+  contexts->input_handler = InputHandlerCreate(contexts->disable_uhid);
   if (!contexts->input_handler) {
     LOG("Failed to create input handler");
     goto drop_client;
@@ -265,7 +266,7 @@ drop_client:
 
 int main(int argc, char* argv[]) {
   if (argc < 2) {
-    LOG("Usage: %s <port>", argv[0]);
+    LOG("Usage: %s <port> [--disable-uhid]", argv[0]);
     return EXIT_FAILURE;
   }
   if (signal(SIGINT, OnSignal) == SIG_ERR ||
@@ -279,6 +280,11 @@ int main(int argc, char* argv[]) {
       .server_fd = -1,
       .client_fd = -1,
   };
+  for (int i = 2; i < argc; i++) {
+    if (!strcmp(argv[i], "--disable-uhid")) {
+      contexts.disable_uhid = true;
+    }
+  }
   contexts.gpu_context = GpuContextCreate(colorspace, range);
   if (!contexts.gpu_context) {
     LOG("Failed to create gpu context");

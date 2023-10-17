@@ -36,7 +36,7 @@ struct InputHandler {
   int uhid_fd;
 };
 
-struct InputHandler* InputHandlerCreate(void) {
+struct InputHandler* InputHandlerCreate(bool disable_uhid) {
   struct InputHandler* input_handler = malloc(sizeof(struct InputHandler));
   if (!input_handler) {
     LOG("Failed to allocate input handler (%s)", strerror(errno));
@@ -47,7 +47,8 @@ struct InputHandler* InputHandlerCreate(void) {
   };
 
   BufferCreate(&input_handler->buffer);
-  input_handler->uhid_fd = open("/dev/uhid", O_RDWR);
+  input_handler->uhid_fd =
+      open(disable_uhid ? "/dev/null" : "/dev/uhid", O_RDWR);
   if (input_handler->uhid_fd == -1) {
     LOG("Failed to open uhid device (%s)", strerror(errno));
     goto rollback_input_handler;

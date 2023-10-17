@@ -22,7 +22,7 @@
 
 struct InputHandler;
 
-struct InputHandler* InputHandlerCreate(void);
+struct InputHandler* InputHandlerCreate(bool disable_uhid);
 int InputHandlerGetEventsFd(struct InputHandler* input_handler);
 bool InputHandlerProcessEvents(struct InputHandler* input_handler);
 bool InputHandlerHandle(struct InputHandler* input_handler, int fd);

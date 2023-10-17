@@ -79,8 +79,7 @@ static void OnWlRegistryGlobalRemove(void* data, struct wl_registry* registry,
 }
 
 static bool InitWaylandGlobals(struct CaptureContextWlr* capture_context) {
-  capture_context->wl_display =
-      wl_display_connect(/*NULL*/ "/run/user/1000/wayland-1");
+  capture_context->wl_display = wl_display_connect(NULL);
   if (!capture_context->wl_display) {
     LOG("Failed to connect wl_display (%s)", strerror(errno));
     return false;
