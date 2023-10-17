@@ -96,6 +96,8 @@ static void MaybeDropClient(struct Contexts* contexts) {
     contexts->encode_context = NULL;
   }
   if (contexts->capture_context) {
+    IoMuxerForget(&contexts->io_muxer,
+                  CaptureContextGetEventsFd(contexts->capture_context));
     CaptureContextDestroy(contexts->capture_context);
     contexts->capture_context = NULL;
   }
