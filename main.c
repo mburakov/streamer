@@ -17,11 +17,13 @@
 
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "capture.h"
@@ -226,6 +228,11 @@ static void OnClientConnecting(void* user) {
     LOG("One client is already connected");
     close(client_fd);
     return;
+  }
+
+  if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &(int){1}, sizeof(int))) {
+    LOG("Failed to set TCP_NODELAY (%s)", strerror(errno));
+    goto drop_client;
   }
 
   contexts->client_fd = client_fd;
