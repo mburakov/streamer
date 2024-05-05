@@ -30,7 +30,6 @@
 #include "wlr-export-dmabuf-unstable-v1.h"
 
 struct CaptureContextWlr {
-  struct IoMuxer* io_muxer;
   struct GpuContext* gpu_context;
   const struct CaptureContextCallbacks* callbacks;
   void* user;

@@ -34,7 +34,6 @@
 static const int kCapturePeriod = 1000000000 / 60;
 
 struct CaptureContextKms {
-  struct IoMuxer* io_muxer;
   struct GpuContext* gpu_context;
   const struct CaptureContextCallbacks* callbacks;
   void* user;
