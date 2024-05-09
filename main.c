@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "audio.h"
 #include "capture.h"
 #include "colorspace.h"
 #include "encode.h"
@@ -47,6 +48,7 @@ static void OnSignal(int status) { g_signal = status; }
 
 struct Contexts {
   bool disable_uhid;
+  struct AudioContext* audio_context;
   struct GpuContext* gpu_context;
   struct IoMuxer io_muxer;
   int server_fd;
@@ -114,6 +116,16 @@ static void MaybeDropClient(struct Contexts* contexts) {
     close(contexts->client_fd);
     contexts->client_fd = -1;
   }
+}
+
+static void OnAudioContextAudioReady(void* user, const void* buffer,
+                                     size_t size) {
+  struct Contexts* contexts = user;
+  LOG("Got a buffer!");
+  // TODO(mburakov): Implement this!
+  (void)contexts;
+  (void)buffer;
+  (void)size;
 }
 
 static void OnCaptureContextFrameReady(void* user,
@@ -189,6 +201,22 @@ static void OnInputEvents(void* user) {
 
 drop_client:
   MaybeDropClient(contexts);
+}
+
+static void OnAudioContextEvents(void* user) {
+  struct Contexts* contexts = user;
+  if (!IoMuxerOnRead(&contexts->io_muxer,
+                     AudioContextGetEventsFd(contexts->audio_context),
+                     &OnAudioContextEvents, user)) {
+    LOG("Failed to reschedule audio io (%s)", strerror(errno));
+    g_signal = SIGABRT;
+    return;
+  }
+  if (!AudioContextProcessEvents(contexts->audio_context)) {
+    LOG("Failed to process audio events");
+    g_signal = SIGABRT;
+    return;
+  }
 }
 
 static void OnCaptureContextEvents(void* user) {
@@ -294,22 +322,42 @@ int main(int argc, char* argv[]) {
       contexts.disable_uhid = true;
     }
   }
+
+  static struct AudioContextCallbacks kAudioContextCallbacks = {
+      .OnAudioReady = OnAudioContextAudioReady,
+  };
+  contexts.audio_context =
+      AudioContextCreate(&kAudioContextCallbacks, &contexts);
+  if (!contexts.audio_context) {
+    LOG("Failed to create audio context");
+    return EXIT_FAILURE;
+  }
+
   contexts.gpu_context = GpuContextCreate(colorspace, range);
   if (!contexts.gpu_context) {
     LOG("Failed to create gpu context");
-    return EXIT_FAILURE;
+    goto rollback_audio_context;
   }
+
   IoMuxerCreate(&contexts.io_muxer);
   contexts.server_fd = CreateServerSocket(argv[1]);
   if (contexts.server_fd == -1) {
     LOG("Failed to create server socket");
     goto rollback_io_muxer;
   }
+
+  if (!IoMuxerOnRead(&contexts.io_muxer,
+                     AudioContextGetEventsFd(contexts.audio_context),
+                     &OnAudioContextEvents, &contexts)) {
+    LOG("Failed to schedule audio io (%s)", strerror(errno));
+    goto rollback_server_fd;
+  }
   if (!IoMuxerOnRead(&contexts.io_muxer, contexts.server_fd,
                      &OnClientConnecting, &contexts)) {
     LOG("Failed to schedule accept (%s)", strerror(errno));
     goto rollback_server_fd;
   }
+
   while (!g_signal) {
     if (IoMuxerIterate(&contexts.io_muxer, -1) && errno != EINTR) {
       LOG("Failed to iterate io muxer (%s)", strerror(errno));
@@ -327,6 +375,8 @@ rollback_server_fd:
 rollback_io_muxer:
   IoMuxerDestroy(&contexts.io_muxer);
   GpuContextDestroy(contexts.gpu_context);
+rollback_audio_context:
+  AudioContextDestroy(contexts.audio_context);
   bool result = g_signal == SIGINT || g_signal == SIGTERM;
   return result ? EXIT_SUCCESS : EXIT_FAILURE;
 }
