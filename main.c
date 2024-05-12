@@ -311,7 +311,7 @@ drop_client:
 
 int main(int argc, char* argv[]) {
   if (argc < 2) {
-    LOG("Usage: %s <port> [--disable-uhid]", argv[0]);
+    LOG("Usage: %s <port> [--disable-uhid] [--disable-audio]", argv[0]);
     return EXIT_FAILURE;
   }
   if (signal(SIGINT, OnSignal) == SIG_ERR ||
@@ -325,20 +325,25 @@ int main(int argc, char* argv[]) {
       .server_fd = -1,
       .client_fd = -1,
   };
+  bool disable_audio = false;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--disable-uhid")) {
       contexts.disable_uhid = true;
+    } else if (!strcmp(argv[i], "--disable-audio")) {
+      disable_audio = true;
     }
   }
 
   static struct AudioContextCallbacks kAudioContextCallbacks = {
       .OnAudioReady = OnAudioContextAudioReady,
   };
-  contexts.audio_context =
-      AudioContextCreate(&kAudioContextCallbacks, &contexts);
-  if (!contexts.audio_context) {
-    LOG("Failed to create audio context");
-    return EXIT_FAILURE;
+  if (!disable_audio) {
+    contexts.audio_context =
+        AudioContextCreate(&kAudioContextCallbacks, &contexts);
+    if (!contexts.audio_context) {
+      LOG("Failed to create audio context");
+      return EXIT_FAILURE;
+    }
   }
 
   contexts.gpu_context = GpuContextCreate(colorspace, range);
@@ -384,7 +389,7 @@ rollback_io_muxer:
   IoMuxerDestroy(&contexts.io_muxer);
   GpuContextDestroy(contexts.gpu_context);
 rollback_audio_context:
-  AudioContextDestroy(contexts.audio_context);
+  if (!disable_audio) AudioContextDestroy(contexts.audio_context);
   bool result = g_signal == SIGINT || g_signal == SIGTERM;
   return result ? EXIT_SUCCESS : EXIT_FAILURE;
 }
