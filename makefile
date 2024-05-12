@@ -12,7 +12,6 @@ libs:=\
 	gbm \
 	glesv2 \
 	libdrm \
-	libpipewire-0.3 \
 	libva \
 	libva-drm
 
@@ -32,6 +31,11 @@ ifdef USE_WAYLAND
 	headers:=$(patsubst %,%.h,$(protocols))
 	libs+=wayland-client
 	CFLAGS+=-DUSE_WAYLAND
+endif
+
+ifdef USE_PIPEWIRE
+	libs+=libpipewire-0.3
+	CFLAGS+=-DUSE_PIPEWIRE
 endif
 
 #CFLAGS+=-DUSE_EGL_MESA_PLATFORM_SURFACELESS

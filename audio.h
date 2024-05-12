@@ -27,10 +27,17 @@ struct AudioContextCallbacks {
   void (*OnAudioReady)(void* user, const void* buffer, size_t size);
 };
 
+#ifdef USE_PIPEWIRE
 struct AudioContext* AudioContextCreate(
     const struct AudioContextCallbacks* callbacks, void* user);
 int AudioContextGetEventsFd(struct AudioContext* audio_context);
 bool AudioContextProcessEvents(struct AudioContext* audio_context);
 void AudioContextDestroy(struct AudioContext* audio_context);
+#else  // USE_PIPEWIRE
+#define AudioContextCreate(...) ((void*)~0)
+#define AudioContextGetEventsFd(...) -1
+#define AudioContextProcessEvents(...) false
+#define AudioContextDestroy(...)
+#endif
 
 #endif  // STREAMER_AUDIO_H_

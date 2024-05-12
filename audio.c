@@ -15,6 +15,8 @@
  * along with streamer.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#ifdef USE_PIPEWIRE
+
 #include "audio.h"
 
 #include <errno.h>
@@ -277,3 +279,5 @@ void AudioContextDestroy(struct AudioContext* audio_context) {
   free(audio_context);
   pw_deinit();
 }
+
+#endif  // USE_PIPEWIRE
