@@ -100,12 +100,11 @@ bool InputHandlerHandle(struct InputHandler* input_handler, int fd) {
         // mburakov: Payload of ping message is not yet available.
         return true;
       }
-      char buffer[sizeof(struct Proto) + sizeof(uint64_t)];
-      struct Proto* proto = (void*)buffer;
-      proto->size = sizeof(uint64_t);
-      proto->type = PROTO_TYPE_MISC;
-      memcpy(proto->data, &event->u, sizeof(uint64_t));
-      if (write(fd, buffer, sizeof(buffer)) != sizeof(buffer)) {
+      struct Proto proto = {
+          .size = sizeof(uint64_t),
+          .type = PROTO_TYPE_MISC,
+      };
+      if (!WriteProto(fd, &proto, &event->u)) {
         LOG("Failed to write pong message (%s)", strerror(errno));
         return false;
       }

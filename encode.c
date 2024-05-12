@@ -23,7 +23,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/uio.h>
 #include <unistd.h>
 #include <va/va.h>
 #include <va/va_drm.h>
@@ -761,24 +760,6 @@ static void UpdatePicHeader(struct EncodeContext* encode_context, bool idr) {
   }
 }
 
-static bool DrainBuffers(int fd, struct iovec* iovec, int count) {
-  for (;;) {
-    ssize_t result = writev(fd, iovec, count);
-    if (result < 0) {
-      if (errno == EINTR) continue;
-      LOG("Failed to write (%s)", strerror(errno));
-      return false;
-    }
-    for (int i = 0; i < count; i++) {
-      size_t delta = MIN((size_t)result, iovec[i].iov_len);
-      iovec[i].iov_base = (uint8_t*)iovec[i].iov_base + delta;
-      iovec[i].iov_len -= delta;
-      result -= delta;
-    }
-    if (!result) return true;
-  }
-}
-
 bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
                               unsigned long long timestamp) {
   bool result = false;
@@ -931,12 +912,8 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
       .flags = idr ? PROTO_FLAG_KEYFRAME : 0,
       .latency = (uint16_t)(MicrosNow() - timestamp),
   };
-  struct iovec iovec[] = {
-      {.iov_base = &proto, .iov_len = sizeof(proto)},
-      {.iov_base = segment->buf, .iov_len = segment->size},
-  };
-  if (!DrainBuffers(fd, iovec, LENGTH(iovec))) {
-    LOG("Failed to drain encoded frame");
+  if (!WriteProto(fd, &proto, segment->buf)) {
+    LOG("Failed to write encoded frame");
     goto rollback_segment;
   }
 

@@ -20,6 +20,7 @@
 
 #include <assert.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #define PROTO_TYPE_MISC 0
 #define PROTO_TYPE_VIDEO 1
@@ -37,5 +38,7 @@ struct Proto {
 
 static_assert(sizeof(struct Proto) == 8 * sizeof(uint8_t),
               "Suspicious proto struct size");
+
+bool WriteProto(int fd, const struct Proto* proto, const void* data);
 
 #endif  // STREAMER_PROTO_H_
