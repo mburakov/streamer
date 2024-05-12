@@ -32,6 +32,7 @@
 #include "encode.h"
 #include "gpu.h"
 #include "input.h"
+#include "proto.h"
 #include "toolbox/io_muxer.h"
 #include "toolbox/perf.h"
 #include "toolbox/utils.h"
@@ -121,11 +122,18 @@ static void MaybeDropClient(struct Contexts* contexts) {
 static void OnAudioContextAudioReady(void* user, const void* buffer,
                                      size_t size) {
   struct Contexts* contexts = user;
-  LOG("Got a buffer!");
-  // TODO(mburakov): Implement this!
-  (void)contexts;
-  (void)buffer;
-  (void)size;
+  if (contexts->client_fd == -1) return;
+
+  struct Proto proto = {
+      .size = (uint32_t)size,
+      .type = PROTO_TYPE_AUDIO,
+      .flags = 0,
+      .latency = 0,  // TODO(mburakov): Implement this!
+  };
+  if (!WriteProto(contexts->client_fd, &proto, buffer)) {
+    LOG("Failed to write audio frame");
+    MaybeDropClient(contexts);
+  }
 }
 
 static void OnCaptureContextFrameReady(void* user,
