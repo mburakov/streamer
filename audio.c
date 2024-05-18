@@ -169,7 +169,7 @@ struct AudioContext* AudioContextCreate(
   struct pw_properties* pw_properties = pw_properties_new(
 #define _(...) __VA_ARGS__
       _(PW_KEY_AUDIO_FORMAT, "S16LE"), _(PW_KEY_AUDIO_RATE, "48000"),
-      _(PW_KEY_AUDIO_CHANNELS, "2"), _(SPA_KEY_AUDIO_POSITION, "[ FL FR ]"),
+      _(PW_KEY_AUDIO_CHANNELS, "2"), _(SPA_KEY_AUDIO_POSITION, "FL,FR"),
       _(PW_KEY_NODE_NAME, "streamer-sink"), _(PW_KEY_NODE_VIRTUAL, "true"),
       _(PW_KEY_MEDIA_CLASS, "Audio/Sink"), NULL
 #undef _
