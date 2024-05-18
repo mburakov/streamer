@@ -124,11 +124,15 @@ static void OnAudioContextAudioReady(void* user, const void* buffer,
   struct Contexts* contexts = user;
   if (contexts->client_fd == -1) return;
 
+  // TODO(mburakov): Stride must be calculated from commandline arguments!
+  static const size_t stride = sizeof(int16_t) * 2;
+  size_t latency = MIN(size / stride, UINT16_MAX);
+
   struct Proto proto = {
       .size = (uint32_t)size,
       .type = PROTO_TYPE_AUDIO,
       .flags = 0,
-      .latency = 0,  // TODO(mburakov): Implement this!
+      .latency = (uint16_t)latency,
   };
   if (!WriteProto(contexts->client_fd, &proto, buffer)) {
     LOG("Failed to write audio frame");
