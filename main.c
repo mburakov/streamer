@@ -126,7 +126,8 @@ static void OnAudioContextAudioReady(void* user, const void* buffer,
 
   // TODO(mburakov): Stride must be calculated from commandline arguments!
   static const size_t stride = sizeof(int16_t) * 2;
-  size_t latency = MIN(size / stride, UINT16_MAX);
+  size_t micros = size * 1000000 / stride / 48000;
+  size_t latency = MIN(micros, UINT16_MAX);
 
   struct Proto proto = {
       .size = (uint32_t)size,
