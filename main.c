@@ -364,7 +364,8 @@ int main(int argc, char* argv[]) {
     goto rollback_io_muxer;
   }
 
-  if (!IoMuxerOnRead(&contexts.io_muxer,
+  if (contexts.audio_context &&
+      !IoMuxerOnRead(&contexts.io_muxer,
                      AudioContextGetEventsFd(contexts.audio_context),
                      &OnAudioContextEvents, &contexts)) {
     LOG("Failed to schedule audio io (%s)", strerror(errno));
@@ -394,7 +395,7 @@ rollback_io_muxer:
   IoMuxerDestroy(&contexts.io_muxer);
   GpuContextDestroy(contexts.gpu_context);
 rollback_audio_context:
-  if (!disable_audio) AudioContextDestroy(contexts.audio_context);
+  if (contexts.audio_context) AudioContextDestroy(contexts.audio_context);
   bool result = g_signal == SIGINT || g_signal == SIGTERM;
   return result ? EXIT_SUCCESS : EXIT_FAILURE;
 }
