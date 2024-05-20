@@ -24,12 +24,14 @@
 struct AudioContext;
 
 struct AudioContextCallbacks {
-  void (*OnAudioReady)(void* user, const void* buffer, size_t size);
+  void (*OnAudioReady)(void* user, const void* buffer, size_t size,
+                       size_t latency);
 };
 
 #ifdef USE_PIPEWIRE
 struct AudioContext* AudioContextCreate(
-    const struct AudioContextCallbacks* callbacks, void* user);
+    const char* audio_config, const struct AudioContextCallbacks* callbacks,
+    void* user);
 int AudioContextGetEventsFd(struct AudioContext* audio_context);
 bool AudioContextProcessEvents(struct AudioContext* audio_context);
 void AudioContextDestroy(struct AudioContext* audio_context);

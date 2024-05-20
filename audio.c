@@ -36,6 +36,7 @@
 #define STATUS_ERR 1
 
 struct AudioContext {
+  size_t one_second_size;
   const struct AudioContextCallbacks* callbacks;
   void* user;
 
@@ -44,6 +45,83 @@ struct AudioContext {
   struct pw_thread_loop* pw_thread_loop;
   struct pw_stream* pw_stream;
 };
+
+static bool LookupChannel(const char* name, uint32_t* value) {
+  struct {
+    const char* name;
+    enum spa_audio_channel value;
+  } static const kChannelMap[] = {
+#define _(op) {.name = #op, .value = SPA_AUDIO_CHANNEL_##op}
+      _(FL),  _(FR),   _(FC),   _(LFE),  _(SL),  _(SR),   _(FLC),
+      _(FRC), _(RC),   _(RL),   _(RR),   _(TC),  _(TFL),  _(TFC),
+      _(TFR), _(TRL),  _(TRC),  _(TRR),  _(RLC), _(RRC),  _(FLW),
+      _(FRW), _(LFE2), _(FLH),  _(FCH),  _(FRH), _(TFLC), _(TFRC),
+      _(TSL), _(TSR),  _(LLFE), _(RLFE), _(BC),  _(BLC),  _(BRC),
+#undef _
+  };
+  for (size_t i = 0; i < LENGTH(kChannelMap); i++) {
+    if (!strcmp(kChannelMap[i].name, name)) {
+      if (value) *value = kChannelMap[i].value;
+      return true;
+    }
+  }
+  return false;
+}
+
+static size_t ParseChannelMap(
+    const char* channel_map,
+    uint32_t channel_positions[SPA_AUDIO_MAX_CHANNELS]) {
+  char minibuf[5];
+  size_t channels_counter = 0;
+  for (size_t i = 0, j = 0;; i++) {
+    switch (channel_map[i]) {
+      case 0:
+      case ',':
+        minibuf[j] = 0;
+        if (channels_counter == SPA_AUDIO_MAX_CHANNELS ||
+            !LookupChannel(minibuf, &channel_positions[channels_counter++]))
+          return 0;
+        if (!channel_map[i]) return channels_counter;
+        j = 0;
+        break;
+      default:
+        if (j == 4) return 0;
+        minibuf[j++] = channel_map[i];
+        break;
+    }
+  }
+}
+
+static bool ParseAudioConfig(const char* audio_config,
+                             const char** out_channel_map,
+                             struct spa_audio_info_raw* out_audio_info) {
+  int sample_rate = atoi(audio_config);
+  if (sample_rate != 44100 && sample_rate != 48000) {
+    LOG("Invalid sample rate requested");
+    return false;
+  }
+  const char* channel_map = strchr(audio_config, ':');
+  if (!channel_map) {
+    LOG("Invalid audio config requested");
+    return false;
+  }
+
+  channel_map++;
+  struct spa_audio_info_raw audio_info = {
+      .format = SPA_AUDIO_FORMAT_S16_LE,
+      .rate = (uint32_t)sample_rate,
+  };
+  audio_info.channels =
+      (uint32_t)ParseChannelMap(channel_map, audio_info.position);
+  if (!audio_info.channels) {
+    LOG("Invalid channel map requested");
+    return false;
+  }
+
+  *out_channel_map = channel_map;
+  *out_audio_info = audio_info;
+  return true;
+}
 
 static void WakeClient(const struct AudioContext* audio_context, char status) {
   if (write(audio_context->waker[1], &status, sizeof(status)) !=
@@ -128,7 +206,15 @@ failure:
 }
 
 struct AudioContext* AudioContextCreate(
-    const struct AudioContextCallbacks* callbacks, void* user) {
+    const char* audio_config, const struct AudioContextCallbacks* callbacks,
+    void* user) {
+  const char* channel_map;
+  struct spa_audio_info_raw audio_info;
+  if (!ParseAudioConfig(audio_config, &channel_map, &audio_info)) {
+    LOG("Failed to parse audio config argument");
+    return NULL;
+  }
+
   pw_init(0, NULL);
   struct AudioContext* audio_context = malloc(sizeof(struct AudioContext));
   if (!audio_context) {
@@ -136,6 +222,8 @@ struct AudioContext* AudioContextCreate(
     return NULL;
   }
   *audio_context = (struct AudioContext){
+      .one_second_size =
+          audio_info.channels * audio_info.rate * sizeof(int16_t),
       .callbacks = callbacks,
       .user = user,
   };
@@ -165,11 +253,9 @@ struct AudioContext* AudioContextCreate(
     goto rollback_thread_loop;
   }
 
-  // TOOD(mburakov): Read these from the commandline?
   struct pw_properties* pw_properties = pw_properties_new(
 #define _(...) __VA_ARGS__
-      _(PW_KEY_AUDIO_FORMAT, "S16LE"), _(PW_KEY_AUDIO_RATE, "48000"),
-      _(PW_KEY_AUDIO_CHANNELS, "2"), _(SPA_KEY_AUDIO_POSITION, "FL,FR"),
+      _(PW_KEY_AUDIO_FORMAT, "S16LE"), _(SPA_KEY_AUDIO_POSITION, channel_map),
       _(PW_KEY_NODE_NAME, "streamer-sink"), _(PW_KEY_NODE_VIRTUAL, "true"),
       _(PW_KEY_MEDIA_CLASS, "Audio/Sink"), NULL
 #undef _
@@ -180,6 +266,9 @@ struct AudioContext* AudioContextCreate(
     goto rollback_thread_loop;
   }
 
+  pw_properties_setf(pw_properties, PW_KEY_AUDIO_RATE, "%du", audio_info.rate);
+  pw_properties_setf(pw_properties, PW_KEY_AUDIO_CHANNELS, "%du",
+                     audio_info.channels);
   static const struct pw_stream_events kPwStreamEvents = {
       .version = PW_VERSION_STREAM_EVENTS,
       .state_changed = OnStreamStateChanged,
@@ -198,14 +287,8 @@ struct AudioContext* AudioContextCreate(
   uint8_t buffer[1024];
   struct spa_pod_builder spa_pod_builder =
       SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-  const struct spa_pod* params[] = {
-      spa_format_audio_raw_build(
-          &spa_pod_builder, SPA_PARAM_EnumFormat,
-          &SPA_AUDIO_INFO_RAW_INIT(.format = SPA_AUDIO_FORMAT_S16_LE,
-                                   .rate = 48000, .channels = 2,
-                                   .position = {SPA_AUDIO_CHANNEL_FL,
-                                                SPA_AUDIO_CHANNEL_FR})),
-  };
+  const struct spa_pod* params[] = {spa_format_audio_raw_build(
+      &spa_pod_builder, SPA_PARAM_EnumFormat, &audio_info)};
   static const enum pw_stream_flags kPwStreamFlags =
       PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS |
       PW_STREAM_FLAG_RT_PROCESS;
@@ -263,7 +346,8 @@ bool AudioContextProcessEvents(struct AudioContext* audio_context) {
     }
     if (!buffer_queue_item) return true;
     audio_context->callbacks->OnAudioReady(
-        audio_context->user, buffer_queue_item->data, buffer_queue_item->size);
+        audio_context->user, buffer_queue_item->data, buffer_queue_item->size,
+        buffer_queue_item->size * 1000000 / audio_context->one_second_size);
     BufferQueueItemDestroy(buffer_queue_item);
   }
 }

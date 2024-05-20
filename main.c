@@ -49,6 +49,7 @@ static void OnSignal(int status) { g_signal = status; }
 
 struct Contexts {
   bool disable_uhid;
+  const char* audio_config;
   struct AudioContext* audio_context;
   struct GpuContext* gpu_context;
   struct IoMuxer io_muxer;
@@ -120,20 +121,15 @@ static void MaybeDropClient(struct Contexts* contexts) {
 }
 
 static void OnAudioContextAudioReady(void* user, const void* buffer,
-                                     size_t size) {
+                                     size_t size, size_t latency) {
   struct Contexts* contexts = user;
   if (contexts->client_fd == -1) return;
-
-  // TODO(mburakov): Stride must be calculated from commandline arguments!
-  static const size_t stride = sizeof(int16_t) * 2;
-  size_t micros = size * 1000000 / stride / 48000;
-  size_t latency = MIN(micros, UINT16_MAX);
 
   struct Proto proto = {
       .size = (uint32_t)size,
       .type = PROTO_TYPE_AUDIO,
       .flags = 0,
-      .latency = (uint16_t)latency,
+      .latency = (uint16_t)MIN(latency, UINT16_MAX),
   };
   if (!WriteProto(contexts->client_fd, &proto, buffer)) {
     LOG("Failed to write audio frame");
@@ -308,6 +304,17 @@ static void OnClientConnecting(void* user) {
     LOG("Failed to schedule capture events reading (%s)", strerror(errno));
     goto drop_client;
   }
+
+  struct Proto proto = {
+      .size = (uint32_t)strlen(contexts->audio_config) + 1,
+      .type = PROTO_TYPE_AUDIO,
+      .flags = PROTO_FLAG_KEYFRAME,
+      .latency = 0,
+  };
+  if (!WriteProto(contexts->client_fd, &proto, contexts->audio_config)) {
+    LOG("Failed to write audio configuration");
+    goto drop_client;
+  }
   return;
 
 drop_client:
@@ -316,7 +323,7 @@ drop_client:
 
 int main(int argc, char* argv[]) {
   if (argc < 2) {
-    LOG("Usage: %s <port> [--disable-uhid] [--disable-audio]", argv[0]);
+    LOG("Usage: %s <port> [--disable-uhid] [--audio <rate:channels>]", argv[0]);
     return EXIT_FAILURE;
   }
   if (signal(SIGINT, OnSignal) == SIG_ERR ||
@@ -330,21 +337,26 @@ int main(int argc, char* argv[]) {
       .server_fd = -1,
       .client_fd = -1,
   };
-  bool disable_audio = false;
+  const char* audio_config = NULL;
   for (int i = 2; i < argc; i++) {
     if (!strcmp(argv[i], "--disable-uhid")) {
       contexts.disable_uhid = true;
-    } else if (!strcmp(argv[i], "--disable-audio")) {
-      disable_audio = true;
+    } else if (!strcmp(argv[i], "--audio")) {
+      audio_config = argv[++i];
+      if (i == argc) {
+        LOG("Audio argument requires a value");
+        return EXIT_FAILURE;
+      }
     }
   }
 
   static struct AudioContextCallbacks kAudioContextCallbacks = {
       .OnAudioReady = OnAudioContextAudioReady,
   };
-  if (!disable_audio) {
+  if (audio_config) {
+    contexts.audio_config = audio_config;
     contexts.audio_context =
-        AudioContextCreate(&kAudioContextCallbacks, &contexts);
+        AudioContextCreate(audio_config, &kAudioContextCallbacks, &contexts);
     if (!contexts.audio_context) {
       LOG("Failed to create audio context");
       return EXIT_FAILURE;
