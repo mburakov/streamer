@@ -2,6 +2,10 @@
 
 This is a lightweight framebuffer streamer. It continuously captures framebuffer with 60 fps rate, converts it into YUV colorspace using GLSL shader, compresses resulting buffers into HEVC bitstream using VA-API, and sends the resulting bitstream to a connected client over tcp connection. Everything is done hardware-accelerated and zero-copy. Streamer receives input events from a connected client over the same tcp connection, and forwards those to kernel using uhid api. This streaming server is accompanied by a lightweight [receiver](https://burakov.eu/receiver.git) client.
 
+When built with Wayland, can also capture the screen in wlroots-based compositors by means of [wlr-export-dmabuf-unstable-v1](https://wayland.app/protocols/wlr-export-dmabuf-unstable-v1) protocol. I found this useful on my AMD system where capturing framebuffer no longer works.
+
+When built with Pipewire, can capture the audio by exposing an arbitrary-configured audio sink. Audio is forwarded over the same connection to the client uncompressed.
+
 ## Building on Linux
 
 Streamer depends on following libraries:
@@ -11,10 +15,17 @@ Streamer depends on following libraries:
 * libdrm
 * libva
 * libva-drm
+* pipewire-0.3 (optional)
+* wayland-client (optional)
 
 Once you have these installed, just
 ```
 make
+```
+
+In case you want to build with pipewire and/or wayland-client,
+```
+make USE_PIPEWIRE=1 USE_WAYLAND=1
 ```
 
 ## Building anywhere else
@@ -25,9 +36,19 @@ I don't care about any other platforms except Linux, so you are on your own. Mor
 
 There are couple of things streamer implies. I.e. that the system supports KMS and that it's actually possible to access framebuffers via libdrm. This is certainly the case with Intel and AMD when using opensource drivers. This is certainly not the case with Nvidia and proprietary drivers. Same stands for hardware-accelerated colorspace conversion. I don't really expect Nvidia to support [EGL_EXT_image_dma_buf_import](https://registry.khronos.org/EGL/extensions/EXT/EGL_EXT_image_dma_buf_import.txt) and related infrastructure. Hardware-accelerated video encoding is achieved by means of VA-API, and Nvidia does not support the latter. I guess you got the point already - no Nvidia please.
 
-Since streamer requires read access to framebuffer and read-write access to uhid device, it is recommended to run it as root. Provide listening port number on commandline as a single argument:
+Streamer requires read-write access to the uhid device and a read access to framebuffer if you go with framebuffer capturing. Make sure to provide necessary permissions. Running as root is one option. Provide listening port number on commandline as a single argument:
 ```
 sudo ./streamer 1337
+```
+
+In case you go with Wayland capturing (and you built with Wayland support), run as an unprevileged user. Make sure you have the read-write permissions on uhid device. I.e. add the user to the input group, and make sure it has read-write permissions on uhid. The latter could be achieved by adding the following snippet to `/etc/udev/rules.d`:
+```
+TBD
+```
+
+If you want to capture audio (and you built with Pipewire support), provide audio channels configuration on the commandline. You must specify sample rate and the channels layout, i.e.:
+```
+./streamer 1337 --audio 48000:FL,FR
 ```
 
 After starting, streamer would wait for incoming connections from [receiver](https://burakov.eu/receiver.git) on the specified port. Streamer does not do capturing until receiver is conencted.
@@ -52,13 +73,9 @@ I tried this one too. Issues there are not as severe as with Steam Link, but sti
 * extremely thin Moonlight video-related configuration options are seem to be ignored entirely by Sunshine,
 * Sunshine crashed on me when I attempted to stream a game running with Proton.
 
-## But there's no audio
-
-This is correct, audio streaming is not supported as of today. Actually pulseaudio has quite a decent implementation of forwarding audio streams over network. When using module-native-protocol-tcp combined with module-tunnel-sink I only get minor distortions when connecting bluetooth headset. Connecting wired headphones produces seamless experience. That said, I might consider adding audio streaming support to the project.
-
 ## Fancy features support status
 
-There are no fancy features in streamer. There's no bitrate control - VA-API configuration selects constant image quality over constant bitrate. There's no frame pacing - because I personally consider it useless for low-latency realtime streaming. There's no network discovery. There's no automatic reconnection. There's no codec selection. There's no fancy configuration interface. There are no options at all. I might consider implementing some of that in the future - or might not, because it works perfectly fine for my use-case in its current state.
+There are no fancy features in streamer. There's no bitrate control - VA-API configuration selects constant image quality over constant bitrate. There's no frame pacing - because I personally consider it useless for low-latency realtime streaming. There's no network discovery. There's no automatic reconnection. There's no codec selection. There's no fancy configuration interface. I might consider implementing some of that in the future - or might not, because it works perfectly fine for my use-case in its current state.
 
 At the same time, it addresses all of the issues listed above for Steam Link and Sunshine/Moonlight. No issues with controls, no issue with video quality, no issues with screen capturing. On top of that instant startup and shutdown both on server- and client-side.
 
