@@ -328,7 +328,7 @@ static void InitializeSeqHeader(struct EncodeContext* encode_context,
               .scaling_list_enabled_flag = 0,            // No scaling lists
               .strong_intra_smoothing_enabled_flag = 0,  // defaulted
 
-              .amp_enabled_flag = features_bits->amp,
+              .amp_enabled_flag = features_bits->amp != 0,
               .sample_adaptive_offset_enabled_flag = features_bits->sao,
               .pcm_enabled_flag = features_bits->pcm,
               .pcm_loop_filter_disabled_flag = 0,  // defaulted
