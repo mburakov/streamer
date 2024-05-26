@@ -305,15 +305,17 @@ static void OnClientConnecting(void* user) {
     goto drop_client;
   }
 
-  struct Proto proto = {
-      .size = (uint32_t)strlen(contexts->audio_config) + 1,
-      .type = PROTO_TYPE_AUDIO,
-      .flags = PROTO_FLAG_KEYFRAME,
-      .latency = 0,
-  };
-  if (!WriteProto(contexts->client_fd, &proto, contexts->audio_config)) {
-    LOG("Failed to write audio configuration");
-    goto drop_client;
+  if (contexts->audio_config) {
+    struct Proto proto = {
+        .size = (uint32_t)strlen(contexts->audio_config) + 1,
+        .type = PROTO_TYPE_AUDIO,
+        .flags = PROTO_FLAG_KEYFRAME,
+        .latency = 0,
+    };
+    if (!WriteProto(contexts->client_fd, &proto, contexts->audio_config)) {
+      LOG("Failed to write audio configuration");
+      goto drop_client;
+    }
   }
   return;
 
