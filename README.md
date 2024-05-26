@@ -41,9 +41,9 @@ Streamer requires read-write access to the uhid device and a read access to fram
 sudo ./streamer 1337
 ```
 
-In case you go with Wayland capturing (and you built with Wayland support), run as an unprevileged user. Make sure you have the read-write permissions on uhid device. I.e. add the user to the input group, and make sure it has read-write permissions on uhid. The latter could be achieved by adding the following snippet to `/etc/udev/rules.d`:
+In case you go with Wayland capturing (and you built with Wayland support), run as an unprevileged user. Make sure you have the read-write permissions on uhid device. I.e. add the user to the input group, and make sure it has read-write permissions on uhid. The latter could be achieved by adding the following snippet to `/etc/udev/rules.d/99-streamer-input.rules`:
 ```
-TBD
+KERNEL=="uhid", GROUP="input", MODE="0660"
 ```
 
 If you want to capture audio (and you built with Pipewire support), provide audio channels configuration on the commandline. You must specify sample rate and the channels layout, i.e.:
