@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Mikhail Burakov. This file is part of streamer.
+ * Copyright (C) 2024 Mikhail Burakov. This file is part of streamer.
  *
  * streamer is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -19,26 +19,31 @@
 #define STREAMER_PROTO_H_
 
 #include <assert.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 
-#define PROTO_TYPE_MISC 0
-#define PROTO_TYPE_VIDEO 1
-#define PROTO_TYPE_AUDIO 2
-
-#define PROTO_FLAG_KEYFRAME 1
-
-struct Proto {
-  uint32_t size;
-  uint8_t type;
-  uint8_t flags;
-  uint16_t latency;
-  uint8_t data[];
+enum ProtoType {
+  kProtoTypeHello,
+  kProtoTypePing,
+  kProtoTypePong,
+  kProtoTypeUhid,
+  kProtoTypeVideo,
+  kProtoTypeAudio,
 };
 
-static_assert(sizeof(struct Proto) == 8 * sizeof(uint8_t),
-              "Suspicious proto struct size");
+struct ProtoHeader {
+  uint32_t size;
+  enum ProtoType type;
+  uint64_t timestamp;
+};
 
-bool WriteProto(int fd, const struct Proto* proto, const void* data);
+static_assert(sizeof(struct ProtoHeader) == 16 * sizeof(uint8_t),
+              "Suspicious proto header struct size");
+
+struct Proto {
+  void (*const Destroy)(struct Proto* self);
+  const struct ProtoHeader* const header;
+  const void* const data;
+};
 
 #endif  // STREAMER_PROTO_H_

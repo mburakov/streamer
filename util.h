@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Mikhail Burakov. This file is part of streamer.
+ * Copyright (C) 2024 Mikhail Burakov. This file is part of streamer.
  *
  * streamer is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,18 +15,18 @@
  * along with streamer.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef STREAMER_CAPTURE_KMS_H_
-#define STREAMER_CAPTURE_KMS_H_
+#ifndef STREAMER_UTIL_H_
+#define STREAMER_UTIL_H_
 
-#include "capture.h"
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
-struct CaptureContextKms;
+#define LENGTH(x) (sizeof(x) / sizeof *(x))
 
-struct CaptureContextKms* CaptureContextKmsCreate(
-    struct GpuContext* gpu_context,
-    const struct CaptureContextCallbacks* callbacks, void* user);
-int CaptureContextKmsGetEventsFd(struct CaptureContextKms* capture_context);
-bool CaptureContextKmsProcessEvents(struct CaptureContextKms* capture_context);
-void CaptureContextKmsDestroy(struct CaptureContextKms* capture_context);
+#define STR_IMPL(x) #x
+#define STR(x) STR_IMPL(x)
 
-#endif  // STREAMER_CAPTURE_KMS_H_
+#define LOG(x, ...) \
+  fprintf(stderr, __FILE__ ":" STR(__LINE__) " " x "\n", ##__VA_ARGS__)
+
+#endif  // STREAMER_UTIL_H_

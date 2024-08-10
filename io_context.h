@@ -15,28 +15,18 @@
  * along with streamer.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef STREAMER_BUFFER_QUEUE_H_
-#define STREAMER_BUFFER_QUEUE_H_
+#ifndef STREAMER_IO_CONTEXT_H_
+#define STREAMER_IO_CONTEXT_H_
 
-#include <stdbool.h>
-#include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
-struct BufferQueue;
+struct Proto;
+struct IoContext;
 
-struct BufferQueueItem {
-  size_t size;
-  uint8_t data[];
-};
+struct IoContext* IoContextCreate(uint16_t port);
+struct Proto* IoContextRead(struct IoContext* io_context);
+bool IoContextWrite(struct IoContext* io_context, struct Proto* proto);
+void IoContextDestroy(struct IoContext* io_context);
 
-struct BufferQueueItem* BufferQueueItemCreate(const void* data, size_t size);
-void BufferQueueItemDestroy(struct BufferQueueItem* buffer_queue_item);
-
-struct BufferQueue* BufferQueueCreate(void);
-bool BufferQueueQueue(struct BufferQueue* buffer_queue,
-                      struct BufferQueueItem* buffer_queue_item);
-bool BufferQueueDequeue(struct BufferQueue* buffer_queue,
-                        struct BufferQueueItem** buffer_queue_item);
-void BufferQueueDestroy(struct BufferQueue* buffer_queue);
-
-#endif  // STREAMER_BUFFER_QUEUE_H_
+#endif  // STREAMER_IO_CONTEXT_H_

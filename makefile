@@ -2,18 +2,9 @@ bin:=$(notdir $(shell pwd))
 src:=$(wildcard *.c)
 obj:=$(src:.c=.o)
 
-obj+=\
-	toolbox/buffer.o \
-	toolbox/io_muxer.o \
-	toolbox/perf.o
-
 libs:=\
-	egl \
-	gbm \
-	glesv2 \
-	libdrm \
-	libva \
-	libva-drm
+	libpipewire-0.3 \
+	wayland-client
 
 protocols_dir:=\
 	wlr-protocols/unstable
@@ -26,19 +17,9 @@ res:=\
 	luma.glsl \
 	chroma.glsl
 
-ifdef USE_WAYLAND
-	obj:=$(patsubst %,%.o,$(protocols)) $(obj)
-	headers:=$(patsubst %,%.h,$(protocols))
-	libs+=wayland-client
-	CFLAGS+=-DUSE_WAYLAND
-endif
+obj:=$(patsubst %,%.o,$(protocols)) $(obj)
+headers:=$(patsubst %,%.h,$(protocols))
 
-ifdef USE_PIPEWIRE
-	libs+=libpipewire-0.3
-	CFLAGS+=-DUSE_PIPEWIRE
-endif
-
-#CFLAGS+=-DUSE_EGL_MESA_PLATFORM_SURFACELESS
 CFLAGS+=$(shell pkg-config --cflags $(libs))
 LDFLAGS+=$(shell pkg-config --libs $(libs))
 
@@ -63,8 +44,7 @@ $(bin): $(obj)
 	wayland-scanner private-code $< $@
 
 clean:
-	-rm $(bin) $(obj) $(headers) \
-		$(foreach proto,$(protocols),$(proto).h $(proto).o)
+	-rm $(bin) $(obj) $(headers)
 
 .PHONY: all clean
 

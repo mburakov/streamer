@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023 Mikhail Burakov. This file is part of streamer.
+ * Copyright (C) 2024 Mikhail Burakov. This file is part of streamer.
  *
  * streamer is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -15,23 +15,15 @@
  * along with streamer.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#ifndef STREAMER_BITSTREAM_H_
-#define STREAMER_BITSTREAM_H_
+#ifndef STREAMER_AUDIO_CONTEXT_H_
+#define STREAMER_AUDIO_CONTEXT_H_
 
-#include <stddef.h>
-#include <stdint.h>
+struct AudioContext;
+struct IoContext;
+struct Proto;
 
-struct Bitstream {
-  void* data;
-  size_t size;
-};
+struct AudioContext* AudioContextCreate(struct IoContext* io_context,
+                                        struct Proto* proto_hello);
+void AudioContextDestroy(struct AudioContext* audio_context);
 
-void BitstreamAppend(struct Bitstream* bitstream, size_t size, uint32_t bits);
-void BitstreamAppendUE(struct Bitstream* bitstream, uint32_t bits);
-void BitstreamAppendSE(struct Bitstream* bitstream, int32_t bits);
-void BitstreamByteAlign(struct Bitstream* bitstream);
-
-void BitstreamInflate(struct Bitstream* bitstream,
-                      const struct Bitstream* source);
-
-#endif  // STREAMER_BITSTREAM_H_
+#endif  // STREAMER_AUDIO_CONTEXT_H_
