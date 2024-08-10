@@ -28,6 +28,7 @@
 #include "io_context.h"
 #include "proto.h"
 #include "util.h"
+#include "video_context.h"
 
 static volatile sig_atomic_t g_signal;
 static void OnSignal(int status) { g_signal = status; }
@@ -48,10 +49,15 @@ static bool SetupSignalHandler(int sig, void (*func)(int)) {
 }
 
 static void HandleClientSession(struct IoContext* io_context) {
-  struct Proto* proto = NULL;
+  struct VideoContext* video_context = VideoContextCreate(io_context);
+  if (!video_context) {
+    LOG("Failed to create video context");
+    return;
+  }
+
   struct AudioContext* audio_context = NULL;
   while (!g_signal) {
-    proto = IoContextRead(io_context);
+    struct Proto* proto = IoContextRead(io_context);
     if (!proto) {
       LOG("Failed to read proto");
       goto leave;
@@ -61,7 +67,8 @@ static void HandleClientSession(struct IoContext* io_context) {
       case kProtoTypeHello:
         if (audio_context) {
           LOG("Audio reconfiguration prohibited");
-          goto rollback_proto;
+          proto->Destroy(proto);
+          goto leave;
         }
         audio_context = AudioContextCreate(io_context, proto);
         if (!audio_context) {
@@ -74,14 +81,14 @@ static void HandleClientSession(struct IoContext* io_context) {
         break;
       default:
         LOG("Unexpected proto received");
-        goto rollback_proto;
+        proto->Destroy(proto);
+        goto leave;
     }
   }
 
-rollback_proto:
-  proto->Destroy(proto);
 leave:
   if (audio_context) AudioContextDestroy(audio_context);
+  VideoContextDestroy(video_context);
 }
 
 int main(int argc, char* argv[]) {
