@@ -21,27 +21,103 @@
 #include <errno.h>
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 
 #include "io_context.h"
 #include "proto.h"
+#include "queue.h"
 #include "util.h"
 
 struct AudioContext {
   struct IoContext* io_context;
   struct pw_thread_loop* thread_loop;
   struct pw_stream* stream;
+
+  mtx_t mutex;
+  struct Queue queue;
+  atomic_int refcount;
 };
 
 struct ProtoImpl {
   struct Proto proto;
   struct ProtoHeader header;
+  struct AudioContext* audio_context;
   uint8_t data[];
 };
 
-static void ProtoDestroy(struct Proto* proto) { free(proto); }
+static struct AudioContext* AudioContextRef(
+    struct AudioContext* audio_context) {
+  atomic_fetch_add_explicit(&audio_context->refcount, 1, memory_order_relaxed);
+  return audio_context;
+}
+
+static void AudioContextUnref(struct AudioContext* audio_context) {
+  if (atomic_fetch_sub_explicit(&audio_context->refcount, 1,
+                                memory_order_relaxed) == 1) {
+    for (void* item; QueuePop(&audio_context->queue, &item); free(item));
+    QueueDestroy(&audio_context->queue);
+    free(audio_context);
+  }
+}
+
+static void ProtoDestroy(struct Proto* proto) {
+  struct ProtoImpl* proto_impl = (void*)proto;
+  struct AudioContext* audio_context = proto_impl->audio_context;
+  if (mtx_lock(&audio_context->mutex) != thrd_success) {
+    LOG("Failed to lock mutex (%s)", strerror(errno));
+    goto rollback_proto_impl;
+  }
+  bool result = QueuePush(&audio_context->queue, proto_impl);
+  assert(mtx_unlock(&audio_context->mutex) == thrd_success);
+  if (!result) {
+    LOG("Failed to queue proto");
+    goto rollback_proto_impl;
+  }
+  AudioContextUnref(audio_context);
+  return;
+
+rollback_proto_impl:
+  free(proto_impl);
+  AudioContextUnref(audio_context);
+}
+
+static struct ProtoImpl* AudioContextGetProto(
+    struct AudioContext* audio_context, size_t size) {
+  if (mtx_lock(&audio_context->mutex) != thrd_success) {
+    LOG("Failed to lock mutex (%s)", strerror(errno));
+    return NULL;
+  }
+
+  struct ProtoImpl* proto_impl = NULL;
+  for (void* item; QueuePop(&audio_context->queue, &item); free(item)) {
+    struct ProtoImpl* result = item;
+    if (result->header.size == size) {
+      proto_impl = result;
+      break;
+    }
+  }
+
+  assert(mtx_unlock(&audio_context->mutex) == thrd_success);
+  if (proto_impl) return proto_impl;
+
+  proto_impl = malloc(sizeof(struct ProtoImpl) + size);
+  if (!proto_impl) {
+    LOG("Failed to allocate proto (%s)", strerror(errno));
+    return NULL;
+  }
+
+  const struct Proto proto = {
+      .Destroy = ProtoDestroy,
+      .header = &proto_impl->header,
+      .data = proto_impl->data,
+  };
+  memcpy(proto_impl, &proto, sizeof(proto));
+  return proto_impl;
+}
 
 static void OnStreamStateChanged(void* arg, enum pw_stream_state old,
                                  enum pw_stream_state state,
@@ -94,19 +170,14 @@ static void OnStreamProcess(void* arg) {
   for (size_t index = 0; index < buffer->buffer->n_datas; index++)
     header.size += buffer->buffer->datas[index].chunk->size;
 
-  struct ProtoImpl* proto_impl = malloc(sizeof(struct ProtoImpl) + header.size);
+  struct ProtoImpl* proto_impl =
+      AudioContextGetProto(audio_context, header.size);
   if (!proto_impl) {
-    LOG("Failed to allocate proto (%s)", strerror(errno));
+    LOG("Failed to get proto");
     goto rollback_buffer;
   }
 
   proto_impl->header = header;
-  const struct Proto proto = {
-    .Destroy = ProtoDestroy,
-    .header = &proto_impl->header,
-    .data = proto_impl->data,
-  };
-  memcpy(proto_impl, &proto, sizeof(proto));
   uint8_t* target = proto_impl->data;
   for (size_t index = 0; index < buffer->buffer->n_datas; index++) {
     const void* source = buffer->buffer->datas[index].data;
@@ -114,6 +185,7 @@ static void OnStreamProcess(void* arg) {
     memcpy(target, source + chunk->offset, chunk->size);
     target += chunk->size;
   }
+  proto_impl->audio_context = AudioContextRef(audio_context);
   if (!IoContextWrite(audio_context->io_context, &proto_impl->proto)) {
     LOG("Failed to write audio proto");
     goto rollback_buffer;
@@ -197,7 +269,7 @@ struct AudioContext* AudioContextCreate(struct IoContext* io_context,
 
   pw_thread_loop_unlock(audio_context->thread_loop);
   proto_hello->Destroy(proto_hello);
-  return audio_context;
+  return AudioContextRef(audio_context);
 
 rollback_stream:
   pw_stream_destroy(audio_context->stream);
@@ -216,5 +288,5 @@ void AudioContextDestroy(struct AudioContext* audio_context) {
   pw_stream_destroy(audio_context->stream);
   pw_thread_loop_unlock(audio_context->thread_loop);
   pw_thread_loop_destroy(audio_context->thread_loop);
-  free(audio_context);
+  AudioContextUnref(audio_context);
 }
