@@ -25,4 +25,3 @@ struct VideoContext* VideoContextCreate(struct IoContext* io_context);
 void VideoContextDestroy(struct VideoContext* video_context);
 
 #endif  // STREAMER_VIDEO_CONTEXT_H_
-

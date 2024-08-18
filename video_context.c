@@ -121,6 +121,124 @@ static void OnDisplayData(void* arg, int fd, uint32_t mask) {
   }
 }
 
+static void OnExportDmabufFrameFrame(
+    void* data, struct zwlr_export_dmabuf_frame_v1* export_dmabuf_frame,
+    uint32_t width, uint32_t height, uint32_t offset_x, uint32_t offset_y,
+    uint32_t buffer_flags, uint32_t flags, uint32_t format, uint32_t mod_high,
+    uint32_t mod_low, uint32_t num_objects) {
+  (void)data;
+  (void)export_dmabuf_frame;
+  (void)width;
+  (void)height;
+  (void)offset_x;
+  (void)offset_y;
+  (void)buffer_flags;
+  (void)flags;
+  (void)format;
+  (void)mod_high;
+  (void)mod_low;
+  (void)num_objects;
+  LOG("%s(data=%p, export_dmabuf_frame=%p, width=%u, height=%u, "
+      "offset_x=%u, offset_y=%u, buffer_flags=0x%x, flags=0x%x, "
+      "format=0x%08x, mod_high=%08x, mod_low=%08x, num_objects=%u)",
+      __FUNCTION__, data, (void*)export_dmabuf_frame, width, height, offset_x,
+      offset_y, buffer_flags, flags, format, mod_high, mod_low, num_objects);
+}
+
+static void OnExportDmabufFrameObject(
+    void* data, struct zwlr_export_dmabuf_frame_v1* export_dmabuf_frame,
+    uint32_t index, int32_t fd, uint32_t size, uint32_t offset, uint32_t stride,
+    uint32_t plane_index) {
+  (void)data;
+  (void)export_dmabuf_frame;
+  (void)index;
+  (void)fd;
+  (void)size;
+  (void)offset;
+  (void)stride;
+  (void)plane_index;
+  LOG("%s(data=%p, export_dmabuf_frame=%p, index=%u, fd=%d, "
+      "size=%u, offset=%u, stride=%u, plane_index=%u)",
+      __FUNCTION__, data, (void*)export_dmabuf_frame, index, fd, size, offset,
+      stride, plane_index);
+}
+
+static void OnExportDmabufFrameReady(
+    void* data, struct zwlr_export_dmabuf_frame_v1* export_dmabuf_frame,
+    uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec) {
+  (void)data;
+  (void)export_dmabuf_frame;
+  (void)tv_sec_hi;
+  (void)tv_sec_lo;
+  (void)tv_nsec;
+  struct VideoContext* video_context = data;
+  LOG("%s(data=%p, export_dmabuf_frame=%p, "
+      "tv_sec_hi=%u, tv_sec_lo=%u, tv_nsec=%u)",
+      __FUNCTION__, data, (void*)export_dmabuf_frame, tv_sec_hi, tv_sec_lo,
+      tv_nsec);
+  zwlr_export_dmabuf_frame_v1_destroy(export_dmabuf_frame);
+}
+
+static void OnExportDmabufFrameCancel(
+    void* data, struct zwlr_export_dmabuf_frame_v1* export_dmabuf_frame,
+    uint32_t reason) {
+  (void)data;
+  (void)export_dmabuf_frame;
+  (void)reason;
+  struct VideoContext* video_context = data;
+  static const char* const kCancelReasons[] = {
+      "temporary",
+      "permanent",
+      "resizing",
+  };
+  LOG("%s(data=%p, export_dmabuf_frame=%p, reason=%s)", __FUNCTION__, data,
+      (void*)export_dmabuf_frame, kCancelReasons[reason]);
+  zwlr_export_dmabuf_frame_v1_destroy(export_dmabuf_frame);
+}
+
+static int RequestCapture(struct spa_loop* loop, bool async, uint32_t seq,
+                          const void* data, size_t size, void* user_data) {
+  (void)loop;
+  (void)async;
+  (void)seq;
+  (void)data;
+  (void)size;
+  struct VideoContext* video_context = user_data;
+  struct zwlr_export_dmabuf_frame_v1* export_dmabuf_frame =
+      zwlr_export_dmabuf_manager_v1_capture_output(
+          video_context->export_dmabuf_manager, 1, video_context->output);
+  if (!export_dmabuf_frame) {
+    LOG("Failed to capture output");
+    // TODO(mburakov): Now what?..
+    return 0;
+  }
+
+  static const struct zwlr_export_dmabuf_frame_v1_listener
+      kExportDmabufFrameListener = {
+          .frame = OnExportDmabufFrameFrame,
+          .object = OnExportDmabufFrameObject,
+          .ready = OnExportDmabufFrameReady,
+          .cancel = OnExportDmabufFrameCancel,
+      };
+  if (zwlr_export_dmabuf_frame_v1_add_listener(
+          export_dmabuf_frame, &kExportDmabufFrameListener, video_context)) {
+    LOG("Failed to add frame listener");
+    goto rollback_export_dmabuf_frame;
+  }
+
+  if (wl_display_flush(video_context->display) == -1) {
+    LOG("Failed to flush display");
+    goto rollback_export_dmabuf_frame;
+  }
+
+  return 0;
+
+rollback_export_dmabuf_frame:
+  zwlr_export_dmabuf_frame_v1_destroy(export_dmabuf_frame);
+  // TODO(mburakov): Now what?..
+  return 0;
+}
+
 struct VideoContext* VideoContextCreate(struct IoContext* io_context) {
   struct VideoContext* video_context = malloc(sizeof(struct VideoContext));
   if (!video_context) {
@@ -148,17 +266,28 @@ struct VideoContext* VideoContextCreate(struct IoContext* io_context) {
     goto rollback_thread_loop;
   }
 
+  struct pw_loop* loop = pw_thread_loop_get_loop(video_context->thread_loop);
+  if (!loop) {
+    LOG("Failed to get thread loop");
+    goto rollback_thread_loop;
+  }
+
   int events_fd = wl_display_get_fd(video_context->display);
   if (events_fd == -1) {
     LOG("Failed to get display fd");
     goto rollback_thread_loop;
   }
 
-  video_context->source =
-      pw_loop_add_io(pw_thread_loop_get_loop(video_context->thread_loop),
-                     events_fd, SPA_IO_IN, false, OnDisplayData, video_context);
+  video_context->source = pw_loop_add_io(loop, events_fd, SPA_IO_IN, false,
+                                         OnDisplayData, video_context);
   if (!video_context->source) {
     LOG("Failed to add thread loop io");
+    goto rollback_thread_loop;
+  }
+
+  if (pw_loop_invoke(loop, RequestCapture, SPA_ID_INVALID, NULL, 0, false,
+                     video_context)) {
+    LOG("Failed to request capture");
     goto rollback_thread_loop;
   }
 
