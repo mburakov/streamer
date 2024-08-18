@@ -3,6 +3,9 @@ src:=$(wildcard *.c)
 obj:=$(src:.c=.o)
 
 libs:=\
+	egl \
+	glesv2 \
+	libdrm \
 	libpipewire-0.3 \
 	wayland-client
 

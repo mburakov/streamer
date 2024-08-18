@@ -17,10 +17,25 @@
 
 uniform sampler2D img_input;
 uniform mediump vec2 sample_offsets[4];
-uniform mediump mat3 colorspace;
-uniform mediump vec3 ranges[2];
-
 varying mediump vec2 texcoord;
+
+const mediump mat3 kColorSpace = mat3(
+   0.299,     0.587,     0.114,
+  -0.168736, -0.331264,  0.5,
+   0.5,      -0.418688, -0.081312
+);
+
+const mediump vec3 kColorRangeBase = vec3(
+  16.0 / 255.0,
+  16.0 / 255.0,
+  16.0 / 255.0
+);
+
+const mediump vec3 kColorRangeScale = vec3(
+  (235.0 - 16.0) / 255.0,
+  (240.0 - 16.0) / 255.0,
+  (240.0 - 16.0) / 255.0
+);
 
 mediump vec4 supersample() {
   return texture2D(img_input, texcoord + sample_offsets[0]) +
@@ -30,8 +45,8 @@ mediump vec4 supersample() {
 }
 
 mediump vec3 rgb2yuv(in mediump vec3 rgb) {
-  mediump vec3 yuv = colorspace * rgb.rgb + vec3(0.0, 0.5, 0.5);
-  return ranges[0] + yuv * ranges[1];
+  mediump vec3 yuv = kColorSpace * rgb.rgb + vec3(0.0, 0.5, 0.5);
+  return kColorRangeBase + yuv * kColorRangeScale;
 }
 
 void main() {
