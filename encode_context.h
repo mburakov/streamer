@@ -24,6 +24,7 @@
 
 struct EncodeContext;
 struct IoContext;
+struct wl_display;
 
 struct EncodeContextFrame {
   void* user_data;
@@ -35,7 +36,8 @@ struct EncodeContextFrame {
 };
 
 struct EncodeContext* EncodeContextCreate(struct IoContext* io_context,
-                                          uint32_t width, uint32_t height);
+                                          uint32_t width, uint32_t height,
+                                          struct wl_display* display);
 struct EncodeContextFrame* EncodeContextDequeue(
     struct EncodeContext* encode_context);
 bool EncodeContextQueue(struct EncodeContext* encode_context,

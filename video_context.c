@@ -170,8 +170,8 @@ static void OnExportDmabufFrameFrame(
 
   struct VideoContext* video_context = data;
   if (!video_context->encode_context) {
-    video_context->encode_context =
-        EncodeContextCreate(video_context->io_context, width, height);
+    video_context->encode_context = EncodeContextCreate(
+        video_context->io_context, width, height, video_context->display);
     if (!video_context->encode_context) {
       LOG("Failed to create encode context");
       // TODO(mburakov): Now what?..

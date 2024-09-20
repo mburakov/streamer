@@ -7,6 +7,7 @@ libs:=\
 	glesv2 \
 	libdrm \
 	libpipewire-0.3 \
+	libva-wayland \
 	wayland-client
 
 protocols_dir:=\
