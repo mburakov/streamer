@@ -19,9 +19,11 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <threads.h>
 #include <va/va.h>
 #include <va/va_drmcommon.h>
 #include <va/va_wayland.h>
@@ -31,6 +33,7 @@
 
 struct EncodeContext {
   struct IoContext* io_context;
+  atomic_bool running;
   size_t width;
   size_t height;
   VADisplay display;
@@ -39,7 +42,32 @@ struct EncodeContext {
   uint32_t packed_headers;
   VAConfigAttribValEncHEVCFeatures hevc_features;
   VAConfigAttribValEncHEVCBlockSizes hevc_block_sizes;
+
+  VAContextID context_id;
+
+  mtx_t mutex;
+  cnd_t cond;
+  thrd_t thread;
+  atomic_int refcount;
 };
+
+static struct EncodeContext* EncodeContextRef(
+    struct EncodeContext* encode_context) {
+  atomic_fetch_add_explicit(&encode_context->refcount, 1, memory_order_relaxed);
+  return encode_context;
+}
+
+static void EncodeContextUnref(struct EncodeContext* encode_context) {
+  if (atomic_fetch_sub_explicit(&encode_context->refcount, 1,
+                                memory_order_relaxed) == 1) {
+    assert(vaDestroyContext(encode_context->display,
+                            encode_context->context_id) == VA_STATUS_SUCCESS);
+    assert(vaDestroyConfig(encode_context->display,
+                           encode_context->config_id) == VA_STATUS_SUCCESS);
+    assert(vaTerminate(encode_context->display) == VA_STATUS_SUCCESS);
+    free(encode_context);
+  }
+}
 
 static const char* VaErrorString(VAStatus error) {
   static const char* kVaErrorStrings[] = {
@@ -165,6 +193,30 @@ static bool InitializeCodecCaps(struct EncodeContext* encode_context) {
   return true;
 }
 
+static int EncodeContextThreadProc(void* arg) {
+  struct EncodeContext* encode_context = arg;
+  for (;;) {
+    if (mtx_lock(&encode_context->mutex) != thrd_success) {
+      LOG("Failed to lock mutex (%s)", strerror(errno));
+      goto leave;
+    }
+    while (
+        atomic_load_explicit(&encode_context->running, memory_order_relaxed)) {
+      assert(cnd_wait(&encode_context->cond, &encode_context->mutex) ==
+             thrd_success);
+    }
+    assert(mtx_unlock(&encode_context->mutex) == thrd_success);
+
+    if (!atomic_load_explicit(&encode_context->running, memory_order_relaxed)) {
+      goto leave;
+    }
+  }
+
+leave:
+  atomic_store_explicit(&encode_context->running, false, memory_order_relaxed);
+  return 0;
+}
+
 struct EncodeContext* EncodeContextCreate(struct IoContext* io_context,
                                           uint32_t width, uint32_t height,
                                           struct wl_display* display) {
@@ -210,8 +262,50 @@ struct EncodeContext* EncodeContextCreate(struct IoContext* io_context,
     goto rollback_config_id;
   }
 
-  return encode_context;
+  // mburakov: Intel fails badly when min_cb_size value is not set to 16 and
+  // log2_min_luma_coding_block_size_minus3 is not set to zero. Judging from
+  // ffmpeg code, calculating one from another should work on other platforms,
+  // but I hardcoded it instead since AMD is fine with alignment on 16 anyway.
+  static const size_t kMinCbSize = 16;
+  size_t aligned_width =
+      (encode_context->width + kMinCbSize - 1) & ~(kMinCbSize - 1);
+  size_t aligned_height =
+      (encode_context->height + kMinCbSize - 1) & ~(kMinCbSize - 1);
 
+  status =
+      vaCreateContext(encode_context->display, encode_context->config_id,
+                      (int)aligned_width, (int)aligned_height, VA_PROGRESSIVE,
+                      NULL, 0, &encode_context->context_id);
+  if (status != VA_STATUS_SUCCESS) {
+    LOG("Failed to create va context (%s)", VaErrorString(status));
+    goto rollback_config_id;
+  }
+
+  if (mtx_init(&encode_context->mutex, mtx_plain) != thrd_success) {
+    LOG("Failed to init mutex (%s)", strerror(errno));
+    goto rollback_context_id;
+  }
+
+  if (cnd_init(&encode_context->cond) != thrd_success) {
+    LOG("Failed to init condition variable (%s)", strerror(errno));
+    goto rollback_mutex;
+  }
+
+  if (thrd_create(&encode_context->thread, &EncodeContextThreadProc,
+                  io_context) != thrd_success) {
+    LOG("Failed to create thread (%s)", strerror(errno));
+    goto rollback_cond;
+  }
+
+  return EncodeContextRef(encode_context);
+
+rollback_cond:
+  cnd_destroy(&encode_context->cond);
+rollback_mutex:
+  mtx_destroy(&encode_context->mutex);
+rollback_context_id:
+  assert(vaDestroyContext(encode_context->display,
+                          encode_context->context_id) == VA_STATUS_SUCCESS);
 rollback_config_id:
   assert(vaDestroyConfig(encode_context->display, encode_context->config_id) ==
          VA_STATUS_SUCCESS);
@@ -240,8 +334,8 @@ bool EncodeContextQueue(struct EncodeContext* encode_context,
 }
 
 void EncodeContextDestroy(struct EncodeContext* encode_context) {
-  assert(vaDestroyConfig(encode_context->display, encode_context->config_id) ==
-         VA_STATUS_SUCCESS);
-  assert(vaTerminate(encode_context->display) == VA_STATUS_SUCCESS);
-  free(encode_context);
+  atomic_store_explicit(&encode_context->running, false, memory_order_relaxed);
+  assert(cnd_broadcast(&encode_context->cond) == thrd_success);
+  assert(thrd_join(encode_context->thread, NULL) == thrd_success);
+  EncodeContextUnref(encode_context);
 }
