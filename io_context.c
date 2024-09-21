@@ -295,9 +295,11 @@ void IoContextDestroy(struct IoContext* io_context) {
   assert(thrd_join(io_context->thread, NULL) == thrd_success);
   cnd_destroy(&io_context->cond);
   mtx_destroy(&io_context->mutex);
-  for (void* item; QueuePop(&io_context->prio, &item); free(item));
+  for (void* item; QueuePop(&io_context->prio, &item);)
+    ((struct Proto*)item)->Destroy(item);
   QueueDestroy(&io_context->prio);
-  for (void* item; QueuePop(&io_context->queue, &item); free(item));
+  for (void* item; QueuePop(&io_context->queue, &item);)
+    ((struct Proto*)item)->Destroy(item);
   QueueDestroy(&io_context->queue);
   assert(!close(io_context->fd));
   free(io_context);
