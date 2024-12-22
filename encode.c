@@ -901,25 +901,43 @@ bool EncodeContextEncodeFrame(struct EncodeContext* encode_context, int fd,
     LOG("Failed to map va buffer (%s)", VaErrorString(status));
     goto rollback_buffers;
   }
-  if (segment->next != NULL) {
-    LOG("Next segment non-null!");
-    abort();
+  bool owned_data = false;
+  void* data = segment->buf;
+  uint32_t size = segment->size;
+  VACodedBufferSegment* next = segment->next;
+  if (next && next->size) {
+    // TODO(mburakov): How to avoid copying?
+    for (VACodedBufferSegment* it = next; it; it = it->next) {
+      size += it->size;
+    }
+    owned_data = true;
+    data = malloc(size);
+    if (!data) {
+      LOG("Failed to allocate interim data buffer (%s)", strerror(errno));
+      goto rollback_segment;
+    }
+    void* ptr = data;
+    for (VACodedBufferSegment* it = segment; it; it = it->next) {
+      memcpy(ptr, it->buf, it->size);
+      ptr = (uint8_t*)ptr + it->size;
+    }
   }
-
   struct Proto proto = {
-      .size = segment->size,
+      .size = size,
       .type = PROTO_TYPE_VIDEO,
       .flags = idr ? PROTO_FLAG_KEYFRAME : 0,
       .latency = (uint16_t)(MicrosNow() - timestamp),
   };
-  if (!WriteProto(fd, &proto, segment->buf)) {
+  if (!WriteProto(fd, &proto, data)) {
     LOG("Failed to write encoded frame");
-    goto rollback_segment;
+    goto rollback_data;
   }
 
   encode_context->frame_counter++;
   result = true;
 
+rollback_data:
+  if (owned_data) free(data);
 rollback_segment:
   vaUnmapBuffer(encode_context->va_display, encode_context->output_buffer_id);
 rollback_buffers:
